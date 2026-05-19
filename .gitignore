@@ -52,3 +52,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# File I/O
+
+files/*
+output_dir/*

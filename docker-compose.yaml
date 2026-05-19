@@ -1,0 +1,65 @@
+services:
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434" # Mappa la porta del container su Windows
+    volumes:
+      - /root/.ollama
+  claude-router:
+    build:
+      context: .
+      dockerfile: Dockerfile # Punta al file appena creato
+    ports:
+      - "3456:3456" # Espone il router su Windows alla porta 3456
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434 # Dice al router come parlare con Ollama
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    volumes:
+      - ./config-router:/root/.claude-code-router
+      - .:/workspace
+    tty: true
+    stdin_open: true
+    depends_on:
+      - ollama
+  # server:
+  #   build:
+  #     context: .
+  #   ports:
+  #     - 8001:8001
+  #   environment:
+  #     - POSTGRES_SERVER=db
+  #     - POSTGRES_USER=postgres
+  #     - POSTGRES_DB=example
+  #     - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #   secrets:
+  #     - db-password
+  #   develop:
+  #     watch:
+  #       - action: rebuild
+  #         path: .
+#   db:
+#     image: postgres:18
+#     restart: always
+#     user: postgres
+#     secrets:
+#       - db-password
+#     volumes:
+#       - db-data:/var/lib/postgresql
+#     environment:
+#       - POSTGRES_DB=example
+#       - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
+#     expose:
+#       - 5432
+#     healthcheck:
+#       test: ["CMD", "pg_isready"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+# volumes:
+#   db-data:
+# secrets:
+#   db-password:
+#     file: db/password.txt

@@ -10,6 +10,8 @@ import json
 import re
 import pysbd
 import psycopg
+import io
+from concurrent.futures import ThreadPoolExecutor
 from pypdf import PdfReader
 from pdf2image import convert_from_path, pdfinfo_from_path
 from sqlalchemy import create_engine, text
@@ -25,21 +27,33 @@ def custom_sentence_splitter(text):
 class LegalSegmenter:
     def __init__(self):
         self.seg = pysbd.Segmenter(language="it", clean=False)
+        # Acronimi comuni nella PA e scuola italiana per evitare split errati
+        self.abbreviations = [
+            'a.s', 'd.p.r', 'd.lgs', 'p.t.o.f', 'd.m', 'n', 'art', 'comma', 'lett', 'all', 'p.e.i', 'p.d.p'
+        ]
 
     def split_sentences(self, text):
+        # Protezione acronimi: sostituisce temporaneamente il punto con un marker
+        for abbr in self.abbreviations:
+            text = re.sub(rf'\b({abbr})\.', r'\1__DOT__', text, flags=re.IGNORECASE)
+
         sentences = self.seg.segment(text)
         refined = []
-        
+        MAX_JOIN_LENGTH = 1000 # Evitiamo di unire blocchi se diventano troppo grandi
+
         for s in sentences:
-            # Regola 1: Prevent colon split (se la frase precedente finiva con :)
-            if refined and refined[-1].strip().endswith(":"):
+            s = s.replace("__DOT__", ".") # Ripristina il punto reale
+            
+            should_join = False
+            if refined:
+                last_s = refined[-1].strip()
+                # Unisce se la riga precedente finisce con ":" oppure è un titolo/riferimento in **grassetto**
+                if (last_s.endswith(":") or (last_s.startswith("**") and last_s.endswith("**"))) \
+                   and (len(last_s) + len(s) < MAX_JOIN_LENGTH):
+                    should_join = True
+            
+            if should_join:
                 refined[-1] = refined[-1] + " " + s
-            
-            # Regola 2: Keep dots without spaces (es. decreto.2024)
-            # Se la frase attuale inizia con un numero o carattere senza spazio dopo un punto
-            # elif refined and re.search(r'\.\d+', refined[-1].strip() + s.strip()):
-            #     refined[-1] = refined[-1] + s
-            
             else:
                 refined.append(s)
         return refined
@@ -47,7 +61,7 @@ class LegalSegmenter:
 PATH_TO_MARK = r"c:\Users\federico.mantoni\AppData\Local\miniconda3\envs\tesi2\Scripts\marker_single.exe"
 os.environ.setdefault('PYPANDOC_PANDOC', 'C:/Users/federico.mantoni/AppData/Local/miniconda3/envs/tesi2/Library/bin/pandoc.exe')
 os.environ["LLM_SERVICE"] = "openai" 
-os.environ["OPENAI_API_BASE"] = "http://localhost:11434"
+os.environ["OLLAMA_API_BASE"] = "http://localhost:11434"
 os.environ["OPENAI_API_KEY"] = "ollama" # Ollama non richiede chiave, ma Marker sì
 os.environ["GEN_MODEL"] = "llama3.1:8b" #
 scuola_info = {"indirizzo": "Via Ada Negri, 34 - 47923 Rimini (RN)", "tel": "(+39) 0541 384159",  "cf": "82007870403", "web": "itsrimini.edu.it", "mail": "RNTF010004@istruzione.it", "pec": "RNTF010004@pec.istruzione.it"}
@@ -55,14 +69,59 @@ scuola_info = {"indirizzo": "Via Ada Negri, 34 - 47923 Rimini (RN)", "tel": "(+3
 def chunk_splitter(doc, splitter, md_parser):
     initial_nodes = md_parser.get_nodes_from_documents([doc])
     nodes = []
+    
+    if len(initial_nodes) > 0:
+    # Soglia minima di caratteri per un chunk (es. un titolo + un paragrafo breve)
+    # Sotto questa soglia, il chunk viene unito al successivo.
+        MIN_CHUNK_SIZE = 200
+        # Soglia massima prima di attivare lo split semantico
+        MAX_CHUNK_SIZE = 2000
 
-    for node in initial_nodes:
-        if len(node.text) < 3000: # Soglia indicativa per una pagina A4 densa
-            nodes.append(node)
-        else:
-            # Se è lungo, usiamo la logica semantica
-            nodes.extend(splitter.get_nodes_from_documents([node]))
-    print(nodes[0])
+        buffer_text = ""
+        buffer_metadata = {}
+
+        for node in initial_nodes:
+            current_text = node.text.strip()
+
+            # Se abbiamo testo nel buffer (da un titolo corto precedente), lo uniamo
+            if buffer_text:
+                current_text = buffer_text + "\n\n" + current_text
+                # Fondiamo i metadati (mantenendo quelli del nodo corrente come primari)
+                combined_metadata = {**buffer_metadata, **node.metadata}
+                buffer_text = ""
+            else:
+                combined_metadata = node.metadata
+
+            # Identifichiamo se il blocco contiene una tabella Markdown
+            is_table = "|" in current_text and "-|-" in current_text
+
+            # Se il chunk risultante è ancora troppo piccolo, lo mettiamo nel buffer e passiamo oltre
+            if len(current_text) < MIN_CHUNK_SIZE and not is_table:
+                buffer_text = current_text
+                buffer_metadata = combined_metadata
+            
+            else:
+            # Se il chunk è di dimensioni accettabili, verifichiamo se passarlo al SemanticSplitter
+                new_doc = Document(text=current_text, metadata=combined_metadata)
+                if not is_table and len(current_text) > MAX_CHUNK_SIZE:
+                # Se troppo grande, lo splitter semantico farà un lavoro più fine
+                    splitted_nodes =splitter.get_nodes_from_documents([new_doc])
+                    if any (len(node.text) < MIN_CHUNK_SIZE for node in splitted_nodes) :
+                        nodes.append(new_doc)
+                    else:
+                        nodes.extend(splitted_nodes)
+                else:
+                    nodes.append(new_doc)
+
+
+        # Se è rimasto qualcosa nel buffer alla fine del documento, lo appendiamo all'ultimo nodo
+        if buffer_text and nodes:
+            nodes[-1] = Document(text=nodes[-1].text + "\n\n" + buffer_text, metadata={**nodes[-1].metadata, **buffer_metadata})
+
+    else:
+        nodes = initial_nodes
+
+    if nodes: print(f"Primo chunk generato: {nodes[0].get_content()[:100]}...")
     return nodes
 
 def get_node_page_number(node):
@@ -146,6 +205,28 @@ def save_document_and_chunks_to_db(file_name, file_url, access_level, total_page
 def run_semantic_chunking(text,  metadata=None, model_name="qwen3-embedding:8b"):
     print(f"--- 🧩 Avvio Semantic Chunking con LlamaIndex ({model_name}) ---")
     print("metadata:", metadata)
+
+    # --- PULIZIA TESTO (Rimozione boilerplate scuola) ---
+    # Definiamo i pattern per identificare le righe di intestazione ripetute
+    junk_patterns = [
+        r'^#*\s*ISTITUTO TECNICO TECNOLOGICO STATALE.*$',
+        r'^#*\s*"ODONE BELLUZZI - LEONARDO DA VINCI".*$',
+        r'^#*\s*RIMINI.*$',
+        r'^#*\s*Via Ada Negri, 34 - 47923 Rimini.*$',
+        r'^#*\s*Tel\..*$',
+        r'^#*\s*Web: ittsrimini\.edu\.it.*$',
+        r'^#*\s*PEC: RNTF010004@pec\.istruzione\.it.*$',
+    ]
+    cleaned_lines = []
+    for line in text.splitlines():
+        is_junk = False
+        if line.strip():
+            is_junk = any(re.match(p, line.strip(), re.IGNORECASE) for p in junk_patterns)
+        
+        if not is_junk:
+            cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines)
+
     embed_model = OllamaEmbedding(
         model_name=model_name,
         base_url="http://localhost:11434",
@@ -154,8 +235,8 @@ def run_semantic_chunking(text,  metadata=None, model_name="qwen3-embedding:8b")
     md_parser = MarkdownNodeParser()
 
     splitter = SemanticSplitterNodeParser(
-        buffer_size=2, 
-        breakpoint_percentile_threshold=95, 
+        buffer_size=3, # Aumentato leggermente per dare più contesto alle finestre di analisi
+        breakpoint_percentile_threshold=95, # Più sensibile ai cambi di argomento
         embed_model=embed_model,
         sentence_splitter=custom_sentence_splitter
     )
@@ -258,8 +339,12 @@ def run_marker_pdf(pdf_path, output_dir):
             PATH_TO_MARK,
             pdf_path,
             "--output_dir", output_dir,
-            "--debug",
-            "--disable_ocr", # Disabilitiamo l'OCR interno di Marker per forzare il fallback
+            "--disable_ocr",
+            "--paginate_output" # Disabilitiamo l'OCR interno di Marker per affidarlo completamente a GLM-OCR in caso di fallback
+            # "--use_llm",
+            # "--llm_service", "marker.services.ollama.OllamaService",
+            # "--ollama_base_url", os.environ["OLLAMA_API_BASE"],
+            # "--ollama_model", "qwen2.5vl:7b"
         ], check=True)
         
         # Pulisci immagini estratte con peso < 30 KB che iniziano con "_"
@@ -289,55 +374,75 @@ def run_marker_pdf(pdf_path, output_dir):
 
 def glm_ocr(pdf_path):
     print(f"--- 🚨 Avvio Fallback GLM-OCR ---")
-    # Nota: assicurati che poppler sia nel path o usa poppler_path=r"C:\..."
-    pages = convert_from_path(pdf_path, 300)
+    poppler_path = r"C:\Users\federico.mantoni\AppData\Local\miniconda3\envs\tesi2\Library\bin"
+    # Ridotto a 200 DPI: ottimo compromesso tra velocità e precisione per Qwen
+    pages = convert_from_path(pdf_path, 200, poppler_path=poppler_path, thread_count=4)
     
-    full_text = ""
-    for i, page in enumerate(pages):
-        temp_img = f"temp_page_{i}.jpg"
-        page.save(temp_img, "JPEG")
-        
-        with open(temp_img, "rb") as f:
-            img_str = base64.b64encode(f.read()).decode('utf-8')
-        
+    def process_page(i, page):
+        # Convertiamo in base64 in memoria senza passare dal disco
+        img_byte_arr = io.BytesIO()
+        page.save(img_byte_arr, format='JPEG', quality=85)
+        img_str = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+
         try:
-        # Chiamata specifica per GLM-OCR
             response = requests.post(
                 "http://localhost:11434/api/generate",
                 json={
-                    "model": "qwen2.5vl:7b", # O il nome esatto con cui l'hai registrato su Ollama
-                    "prompt": "Analizza attentamente questa immagine e trascrivi tutto il testo. Se vedi delle tabelle, ricostruiscile usando il formato Markdown. Sii estremamente preciso.",
+                    "model": "qwen2.5vl:7b",
+                    "prompt": (
+                        "Agisci come un esperto OCR. Trascrivi il testo di questa pagina. "
+                        "REGOLE: 1. Tabelle in Markdown standard (| colonna |). "
+                        "2. Mantieni i titoli (#, ##). 3. Solo testo, no commenti."
+                    ),
                     "images": [img_str],
                     "stream": False,
                     "options": {
-                        "num_gpu": 99,  # 99 dice a Ollama: "metti tutto quello che puoi sulla GPU"
-                        "num_ctx": 8192 # Aumenta la memoria per gestire bene le immagini
+                        "num_gpu": 99,
+                        "num_ctx": 4096,
+                        "temperature": 0
                     }
-                }
+                },
+                timeout=120
             )
-
             res_json = response.json()
-            # Prova a prendere la risposta in entrambi i formati possibili
             testo_pagina = res_json.get("response", "")
             if not testo_pagina and "message" in res_json:
                 testo_pagina = res_json["message"].get("content", "")
-
-            full_text += testo_pagina + "\n\n"
-            print(f"Pagina {i} elaborata.")
-
-
+            
+            print(f"✅ Pagina {i+1} completata")
+            return i, testo_pagina
         except Exception as e:
-            print(f"Errore chiamata Ollama pagina {i}: {e}")
-        finally:
-            if os.path.exists(temp_img):
-                os.remove(temp_img)
+            print(f"❌ Errore pagina {i+1}: {e}")
+            return i, f"[Errore OCR Pagina {i+1}]"
 
+    # Parallelizziamo le richieste (max_workers=2 per le tue 2 GPU)
+    results = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(process_page, i, page) for i, page in enumerate(pages)]
+        for future in futures:
+            results.append(future.result())
+
+    # Ordiniamo i risultati per indice per mantenere l'ordine delle pagine
+    results.sort(key=lambda x: x[0])
+    full_text = "\n\n".join([r[1] for r in results])
     return full_text.strip()
 
-def run_marker_pdf_with_fallback(pdf_path, output_dir):
+def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
     base_output_dir = os.path.join(os.path.abspath(output_dir), base_name)
     
+    if force_ocr:
+        print("--- 🚨 OCR forzata: Avvio GLM-OCR ---")
+        # Se l'OCR è forzata, bypassa Marker e vai direttamente a glm_ocr
+        result_text = glm_ocr(pdf_path)
+        # Salva il risultato del fallback anche quando forzato
+        fallback_dir = os.path.join(output_dir, base_name)
+        os.makedirs(fallback_dir, exist_ok=True)
+        fallback_path = os.path.join(fallback_dir, base_name + ".md")
+        with open(fallback_path, "w", encoding="utf-8") as f:
+            f.write(result_text)
+        return result_text
+
     # Prova prima con Marker
     result_text = run_marker_pdf(pdf_path, output_dir)
     
@@ -365,14 +470,17 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir):
     return result_text
 
 
-def process_single_file(file_path, output_dir="output_dir", metadata=None):
+def process_single_file(file_path, output_dir="output_dir", metadata=None): # Aggiunto metadata
     access_level = metadata.get("access_level") if metadata else None
     if not access_level:
         print(f"❌ Access level non trovato in {file_path}. Rifiuto il caricamento.")
         return []
 
+    force_ocr = metadata.get("module_option") == "sì" # Estrai l'opzione per forzare l'OCR
+
     print(f"Elaboro file: {file_path}")
-    content = get_md_content(file_path, output_dir)
+    # Passa l'opzione force_ocr a get_md_content
+    content = get_md_content(file_path, output_dir, force_ocr=force_ocr)
     if not content:
         print(f"❌ Contenuto non disponibile per {file_path}. Salto.")
         return []
@@ -394,13 +502,18 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None):
     return file_chunks
 
 
-def get_md_content(file_path, output_dir="output_dir"):
+def get_md_content(file_path, output_dir="output_dir", force_ocr=False): # Aggiunto force_ocr
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
-        return run_marker_pdf_with_fallback(file_path, output_dir)
+        # Passa force_ocr alla funzione di elaborazione PDF
+        return run_marker_pdf_with_fallback(file_path, output_dir, force_ocr=force_ocr)
     elif ext == ".docx":
+        if force_ocr:
+            print("⚠️ OCR forzata richiesta per DOCX. Attualmente supportata solo per PDF. Procedo con conversione standard.")
         return convert_docx_to_md(file_path, output_dir)
     elif ext == ".md":
+        if force_ocr:
+            print("⚠️ OCR forzata richiesta per MD. Non applicabile. Procedo con lettura standard.")
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     else:
@@ -418,11 +531,9 @@ def process_folder(folder_path, output_dir="output_dir", metadata=None):
         for filename in files:
             file_path = os.path.join(root, filename)
             ext = os.path.splitext(filename)[1].lower()
-            if ext not in {".pdf", ".docx", ".md"}:
-                continue
-
-            file_chunks = process_single_file(file_path, folder_output_dir, metadata)
-            all_chunks.extend(file_chunks)
+            if ext in {".pdf", ".docx", ".md"}:
+                file_chunks = process_single_file(file_path, folder_output_dir, metadata)
+                all_chunks.extend(file_chunks)
 
     return all_chunks
 
@@ -439,9 +550,9 @@ def save_semantic_chunks(chunks, output_path):
 execute_all = False
 
 if __name__ == "__main__":
-    input_path = r"files/Modulo-Richiesta-permessi-alunni-Uscita-anticipata-e-Ingresso-posticipato-per-motivi-di-trasorto-_25-26.docx"  # Sostituisci con il percorso reale del tuo file o cartella
+    input_path = r"files\Regolamento-disciplinare.pdf"  # Sostituisci con il percorso reale del tuo file o cartella
     output_dir = "output_dir"
-    metadata = {"access_level": "public"}  # Sostituisci con la logica reale per estrarre l'access level
+    metadata = {"access_level": "public", "module_option": "no"}  # Sostituisci con la logica reale per estrarre l'access level
     ensure_output_dir(output_dir)
 
     if os.path.isdir(input_path):

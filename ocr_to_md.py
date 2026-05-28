@@ -11,8 +11,9 @@ import re
 import pysbd
 import psycopg
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from pdf2image import convert_from_path, pdfinfo_from_path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -20,9 +21,36 @@ from llama_index.core.node_parser import SemanticSplitterNodeParser, MarkdownNod
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core import Document, Settings
 from config import settings
+from PIL import ImageOps, ImageEnhance, Image
+
+# Configurazione cartella debug per immagini OCR
+DEBUG_DIR = "ocr_debug_images"
+if os.path.exists(DEBUG_DIR):
+    shutil.rmtree(DEBUG_DIR)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+MAX_PAGES_TABLE_OCR = 4
 
 def custom_sentence_splitter(text):
     return LegalSegmenter().split_sentences(text)
+
+def clean_junk_text(text):
+    """Rimuove le righe di boilerplate della scuola dal testo markdown."""
+    junk_patterns = [
+        r'^#*\s*ISTITUTO TECNICO TECNOLOGICO STATALE.*$',
+        r'^#*\s*"ODONE BELLUZZI - LEONARDO DA VINCI".*$',
+        r'^#*\s*RIMINI.*$',
+        r'^#*\s*Via Ada Negri, 34 - 47923 Rimini.*$',
+        r'^#*\s*Tel\..*$',
+        r'^#*\s*Web: ittsrimini\.edu\.it.*$',
+        r'^#*\s*PEC: RNTF010004@pec\.istruzione\.it.*$',
+    ]
+    cleaned_lines = []
+    for line in text.splitlines():
+        if line.strip() and any(re.match(p, line.strip(), re.IGNORECASE) for p in junk_patterns):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 class LegalSegmenter:
     def __init__(self):
@@ -206,26 +234,7 @@ def run_semantic_chunking(text,  metadata=None, model_name="qwen3-embedding:8b")
     print(f"--- 🧩 Avvio Semantic Chunking con LlamaIndex ({model_name}) ---")
     print("metadata:", metadata)
 
-    # --- PULIZIA TESTO (Rimozione boilerplate scuola) ---
-    # Definiamo i pattern per identificare le righe di intestazione ripetute
-    junk_patterns = [
-        r'^#*\s*ISTITUTO TECNICO TECNOLOGICO STATALE.*$',
-        r'^#*\s*"ODONE BELLUZZI - LEONARDO DA VINCI".*$',
-        r'^#*\s*RIMINI.*$',
-        r'^#*\s*Via Ada Negri, 34 - 47923 Rimini.*$',
-        r'^#*\s*Tel\..*$',
-        r'^#*\s*Web: ittsrimini\.edu\.it.*$',
-        r'^#*\s*PEC: RNTF010004@pec\.istruzione\.it.*$',
-    ]
-    cleaned_lines = []
-    for line in text.splitlines():
-        is_junk = False
-        if line.strip():
-            is_junk = any(re.match(p, line.strip(), re.IGNORECASE) for p in junk_patterns)
-        
-        if not is_junk:
-            cleaned_lines.append(line)
-    text = "\n".join(cleaned_lines)
+    text = clean_junk_text(text)
 
     embed_model = OllamaEmbedding(
         model_name=model_name,
@@ -262,13 +271,18 @@ def run_semantic_chunking(text,  metadata=None, model_name="qwen3-embedding:8b")
     current_page = 1 
     for node in nodes:
         content = node.get_content()
-        # Cerca il tag id="page-N" nel contenuto del chunk
-        match = re.search(r'id="page-(\d+)', content)
-        if match:
-            current_page = int(match.group(1))
+        # Cerca il tag {N}------------------ nel contenuto del chunk
+        page_tags = re.findall(r'\{(\d+)\}-+', content)
+        if page_tags:
+            # Il separatore di Marker è 0-based, prendiamo l'ultima occorrenza trovata nel chunk
+            current_page = int(page_tags[-1]) + 1
         
         # Iniettiamo il metadato direttamente nel nodo LlamaIndex
         node.metadata["page_number"] = current_page
+
+        # Rimuove il separatore dal testo del chunk per pulizia (come richiesto)
+        cleaned_content = re.sub(r'\{(\d+)\}-+', '', content).strip()
+        node.set_content(cleaned_content)
 
     # --- BATCH EMBEDDING ---
     chunk_texts = [node.get_content() for node in nodes]
@@ -344,7 +358,7 @@ def run_marker_pdf(pdf_path, output_dir):
             # "--use_llm",
             # "--llm_service", "marker.services.ollama.OllamaService",
             # "--ollama_base_url", os.environ["OLLAMA_API_BASE"],
-            # "--ollama_model", "qwen2.5vl:7b"
+            # "--ollama_model", "qwen2.5vl:3b"
         ], check=True)
         
         # Pulisci immagini estratte con peso < 30 KB che iniziano con "_"
@@ -372,60 +386,269 @@ def run_marker_pdf(pdf_path, output_dir):
         print("Errore: file non trovato.")
     return None
 
-def glm_ocr(pdf_path):
-    print(f"--- 🚨 Avvio Fallback GLM-OCR ---")
+def glm_ocr(pdf_path, target_page_indices=None, table_bboxes=None):
+    print(f"--- 🚨 Avvio Vision-OCR (Qwen2.5-VL) con contesto Chat ---")
     poppler_path = r"C:\Users\federico.mantoni\AppData\Local\miniconda3\envs\tesi2\Library\bin"
-    # Ridotto a 200 DPI: ottimo compromesso tra velocità e precisione per Qwen
-    pages = convert_from_path(pdf_path, 200, poppler_path=poppler_path, thread_count=4)
     
-    def process_page(i, page):
-        # Convertiamo in base64 in memoria senza passare dal disco
+    if target_page_indices is not None:
+        first = min(target_page_indices) + 1
+        last = max(target_page_indices) + 1
+        pages_list = convert_from_path(pdf_path, 180, first_page=first, last_page=last, poppler_path=poppler_path)
+        page_map = {idx: pages_list[i] for i, idx in enumerate(range(first-1, last))}
+    else:
+        pages_list = convert_from_path(pdf_path, 180, poppler_path=poppler_path, thread_count=4)
+        page_map = {i: p for i, p in enumerate(pages_list)}
+        target_page_indices = sorted(list(page_map.keys()))
+    
+    def encode_image(img):
+        grayscale_img = img.convert('L')
+        enhancer = ImageEnhance.Contrast(grayscale_img)
+        optimized_img = enhancer.enhance(1.3)
         img_byte_arr = io.BytesIO()
-        page.save(img_byte_arr, format='JPEG', quality=85)
-        img_str = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+        optimized_img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
+        return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+
+     # LOGICA DI STITCHING PER TABELLE SPEZZATE
+    if table_bboxes and len(target_page_indices) > 1:
+        print(f"🧩 Stitching di {len(target_page_indices)} pagine per OCR unificato...")
+        crops = []
+        try:
+            reader = PdfReader(pdf_path)
+        except:
+            reader = None
+
+        for i in target_page_indices:
+            img = page_map[i]
+            bboxes = table_bboxes.get(i, [])
+            img_w, img_h = img.size
+            
+            crop_box = (
+                0,                      # Prendi tutta la larghezza da sinistra
+                int(img_h * 0.18),               # Inizio tabella rilevato o fallback
+                img_w,                  # Fino a destra
+                int(img_h * 0.95)       # Salta il piè di pagina in basso
+            )
+            crops.append(img.crop(crop_box))
+        
+        if crops:
+            total_w = max(c.width for c in crops)
+            total_h = sum(c.height for c in crops)
+            stitched = Image.new('RGB', (total_w, total_h), (255, 255, 255))
+            curr_y = 0
+            for c in crops:
+                stitched.paste(c, (0, curr_y))
+                curr_y += c.height
+            
+            # Salvataggio debug dell'immagine unita
+            debug_path = os.path.join(DEBUG_DIR, f"stitched_p{target_page_indices[0]+1}_to_p{target_page_indices[-1]+1}.jpg")
+            stitched.save(debug_path, "JPEG")
+            
+            img_str = encode_image(stitched)
+            prompt = ("Sei un assistente AI specializzato nell'OCR visivo e nella digitalizzazione avanzata di documenti istituzionali e scolastici.\n"
+    "Il tuo compito è trascrivere l'immagine allegata, che può contenere tabelle, elenchi puntati complessi, "
+    "testo strutturato in colonne o sezioni spezzate.\n\n"
+    
+    "Segui tassativamente queste linee guida operative:\n"
+    "1. **Mantenimento del Layout Strutturato**: Se l'immagine contiene tabelle o quadri sanzionatori/orari, "
+    "estrai il contenuto esclusivamente in formato tabella Markdown standard utilizzando i pipe (es. | Colonna 1 | Colonna 2 |).\n"
+    "2. **Gestione delle Colonne e dei Contenuti Ripetitivi**: Se il testo è organizzato in colonne parallele "
+    "o presenta sezioni ricorrenti (es. intestazioni identiche come 'PROCEDURA' o liste puntate simili), "
+    "ricostruisci la continuità logica leggendo da sinistra a destra e dall'alto verso il basso. Non unire o "
+    "confondere i contenuti di righe o tabelle differenti.\n"
+    "3. **Integrazione del Testo Troncato**: Se una frase o una riga di una tabella appare interrotta o tagliata "
+    "sul margine superiore o inferiore dell'immagine, trascrivila fedelmente fino all'ultimo carattere visibile, "
+    "senza inventare il finale e senza interrompere la struttura del Markdown.\n"
+    "4. **Fedeltà Assoluta**: Non riassumere, non omettere righe e non aggiungere commenti personali, introduzioni o spiegazioni. "
+    "Trascrivi anche i simboli di spunta o quadratini (es. '□' o '-') mantenendoli come elenchi puntati Markdown.\n\n"
+    
+    "Restituisci esclusivamente il testo convertito in Markdown pulito. "
+    "Appena hai terminato l'intera trascrizione, scrivi la parola chiave [FINE] e interrompi l'output.")
+            
+            headers = {"Connection": "close"}
+            response = requests.post(
+                "http://localhost:11434/api/generate", 
+                json={
+                    "model": "qwen2.5vl:3b", 
+                    "images": [img_str], 
+                    "prompt": prompt, 
+                    "stream": False, 
+                    "options": {"num_ctx": 24576, "temperature": 0.2, "repeat_penalty": 1.4, "num_predict": 8192, "frequency_penalty": 1.5, "stop": ["[FINE]"]}
+                }, 
+                headers=headers,
+                timeout=300
+            )
+            output = response.json().get("response", "").strip()
+
+            print("🧼 Forzo lo scaricamento del runner di Ollama per liberare VRAM...")
+            requests.post("http://localhost:11434/api/generate", json={"model": "qwen2.5vl:3b", "keep_alive": 0})
+            time.sleep(2)
+            return output
+
+    results_dict = {}
+
+    messages = []
+
+    # Processo sequenziale per mantenere la cronologia della chat e il contesto
+    target_pages = [(i, page_map[i]) for i in target_page_indices]
+    for i, page in target_pages:
+        # Salvataggio debug dell'immagine della singola pagina
+        debug_path = os.path.join(DEBUG_DIR, f"page_{i+1}.jpg")
+        page.save(debug_path, "JPEG")
+        
+        img_str = encode_image(page)
+        
+        # Prompt ottimizzato per la modalità Chat
+        prompt = (
+            f"Questa immagine rappresenta la pagina {i+1} del documento. Trascrivine il contenuto in Markdown standard. "
+            "Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella e uniscila ad essa."
+            "Se vedi parti di tabella che hanno una sola riga e colonna, trasformali in un elenco puntato."
+            "Se vedi parti di tabella con una sola colonna e una sola parola al suo interno, trasformalo in un titolo"
+            "Assicurati di scrivere tutto il testo nelle tabelle, se non riesci a dividere correttamente una riga di una tabella, trasformala in un paragrafo normale ma mantieni il testo."
+            "Mantieni titoli e strutture. Solo testo Markdown, no commenti."
+        )
 
         try:
+            headers = {"Connection": "close"}
             response = requests.post(
                 "http://localhost:11434/api/generate",
                 json={
-                    "model": "qwen2.5vl:7b",
-                    "prompt": (
-                        "Agisci come un esperto OCR. Trascrivi il testo di questa pagina. "
-                        "REGOLE: 1. Tabelle in Markdown standard (| colonna |). "
-                        "2. Mantieni i titoli (#, ##). 3. Solo testo, no commenti."
-                    ),
+                    "model": "qwen2.5vl:3b",
                     "images": [img_str],
+                    "prompt": prompt,
                     "stream": False,
                     "options": {
-                        "num_gpu": 99,
-                        "num_ctx": 4096,
-                        "temperature": 0
+                        "num_ctx": 16384,
+                        "num_predict": 4096,
+                        "temperature": 0.2,
+                        "repeat_penalty": 1.3
                     }
-                },
-                timeout=120
+                }, 
+                headers=headers,
+                timeout=300
             )
             res_json = response.json()
-            testo_pagina = res_json.get("response", "")
-            if not testo_pagina and "message" in res_json:
-                testo_pagina = res_json["message"].get("content", "")
+            testo_pagina = res_json.get("response", "").strip()
+            testo_pagina = clean_junk_text(testo_pagina)
             
-            print(f"✅ Pagina {i+1} completata")
-            return i, testo_pagina
+            results_dict[i] = testo_pagina
+            print(f"✅ Pagina {i+1} completata.")
+
+            # Forza lo scaricamento del modello per evitare freeze tra pagine
+            requests.post("http://localhost:11434/api/generate", json={"model": "qwen2.5vl:3b", "keep_alive": 0})
+            time.sleep(2)
+
         except Exception as e:
             print(f"❌ Errore pagina {i+1}: {e}")
-            return i, f"[Errore OCR Pagina {i+1}]"
+            results_dict[i] = f"[Errore OCR Pagina {i+1}]"
+    if target_page_indices is not None:
+        return results_dict
 
-    # Parallelizziamo le richieste (max_workers=2 per le tue 2 GPU)
-    results = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(process_page, i, page) for i, page in enumerate(pages)]
-        for future in futures:
-            results.append(future.result())
-
-    # Ordiniamo i risultati per indice per mantenere l'ordine delle pagine
-    results.sort(key=lambda x: x[0])
-    full_text = "\n\n".join([r[1] for r in results])
+    sorted_indices = sorted(results_dict.keys())
+    full_text = "\n\n".join([results_dict[i] for i in sorted_indices])
     return full_text.strip()
+
+def get_table_data(base_output_dir):
+    """Analizza blocks.json di Marker per trovare pagine con tabelle e le loro bounding box."""
+    blocks_path = os.path.join(base_output_dir, "blocks.json")
+    if not os.path.exists(blocks_path):
+        return {}
+    
+    table_data = {} # page_id -> list of bboxes
+    list_group_data = {} # page_id -> list of bboxes (tipo 6)
+    page_top_level_blocks = {} # page_id -> primi blocchi della pagina
+
+    def find_data_recursive(blocks):
+        for block in blocks:
+            b_type = str(block.get("block_type", "")).lower()
+            b_desc = str(block.get("block_description", "")).lower()
+            pid = block.get("page_id")
+            bbox = block.get("polygon", {}).get("bbox")
+            
+            # Se è un blocco pagina (tipo 8), salviamo i suoi figli diretti per l'euristica
+            if b_type == "8" and pid is not None:
+                page_top_level_blocks[pid] = block.get("children", [])
+
+            # Monitoriamo tipi 27 (Table) e 24 (TOC) che spesso contengono i dati strutturati
+            if "table" in b_desc or "table" in b_type or b_type in ["27", "24"]:
+                if pid is not None and bbox:
+                    if pid not in table_data:
+                        table_data[pid] = []
+                    table_data[pid].append(bbox)
+            
+            # Monitoriamo i List Group (tipo 6) per l'euristica di continuità
+            if b_type == "6" or "list group" in b_desc:
+                if pid is not None and bbox:
+                    if pid not in list_group_data:
+                        list_group_data[pid] = []
+                    list_group_data[pid].append(bbox)
+            
+            # Esplora ricorsivamente i figli se presenti (chiave 'children' in Marker)
+            children = block.get("children")
+            if isinstance(children, list):
+                find_data_recursive(children)
+
+    try:
+        with open(blocks_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Gestisce sia liste dirette che dizionari contenenti la chiave 'blocks'
+            blocks_to_process = data if isinstance(data, list) else data.get("blocks", [])
+            find_data_recursive(blocks_to_process)
+            
+        # APPLICAZIONE EURISTICA: List Group (p.x) -> Tabella nei primi 8 blocchi (p.x+1)
+        sorted_pids = sorted(list(page_top_level_blocks.keys()))
+        for pid in sorted_pids:
+            next_pid = pid + 1
+            if pid in list_group_data and next_pid in page_top_level_blocks:
+                # Controlla se nei primi 8 elementi della pagina successiva c'è una tabella
+                has_early_table = False
+                for b in page_top_level_blocks[next_pid][:8]:
+                    bt = str(b.get("block_type", "")).lower()
+                    bd = str(b.get("block_description", "")).lower()
+                    if "table" in bd or "table" in bt or bt in ["27", "24"]:
+                        has_early_table = True
+                        break
+                
+                if has_early_table:
+                    print(f"🔗 Euristica: Pagina {pid+1} (List Group) collegata a Tabella in Pagina {next_pid+1}")
+                    if pid not in table_data:
+                        table_data[pid] = []
+                    # Aggiungiamo i bbox dei list group come se fossero tabelle per forzare il crop
+                    table_data[pid].extend(list_group_data[pid])
+
+    except Exception as e:
+        print(f"⚠️ Errore lettura blocks.json: {e}")
+    return table_data
+
+def assemble_hybrid_markdown(marker_md, ocr_results):
+    """
+    Sostituisce le pagine testuali di Marker con l'output Vision OCR.
+    ocr_results: { start_page_idx: (lista_pagine, testo_ocr) }
+    """
+    page_pattern = r'(\{\d+\}-+)'
+    parts = re.split(page_pattern, marker_md)
+    
+    assembled = [parts[0]]
+    skip_until_page = -1
+    
+    for i in range(1, len(parts), 2):
+        tag = parts[i]
+        content = parts[i+1] if (i+1) < len(parts) else ""
+        
+        page_match = re.search(r'\{(\d+)\}', tag)
+        if not page_match: continue
+        current_page_idx = int(page_match.group(1))
+
+        if current_page_idx <= skip_until_page:
+            continue # Salta le pagine che sono state accorpate in un gruppo OCR precedente
+            
+        if current_page_idx in ocr_results:
+            pages_group, text = ocr_results[current_page_idx]
+            print(f"🔄 Ibridazione: Inserimento blocco OCR per pagine {pages_group}")
+            assembled.append(tag + "\n" + text)
+            skip_until_page = max(pages_group)
+        else:
+            assembled.append(tag + content)
+    return "".join(assembled)
 
 def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -444,29 +667,61 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
         return result_text
 
     # Prova prima con Marker
-    result_text = run_marker_pdf(pdf_path, output_dir)
+    marker_text = run_marker_pdf(pdf_path, output_dir)
     
-    # Se Marker fallisce o restituisce meno di 100 caratteri (testo troppo corto per un modulo)
-    if not result_text or len(result_text) < 100:
+    if not marker_text or len(marker_text) < 100:
         print("⚠️ Marker ha prodotto un risultato insufficiente. Attivo fallback Vision...")
-        
-        # Elimina l'intera directory di output di Marker se il fallback viene attivato
         if os.path.exists(base_output_dir):
             try:
                 shutil.rmtree(base_output_dir)
-                print(f"🗑️ Eliminato output di Marker: {base_output_dir}")
             except Exception as e:
                 print(f"⚠️ Errore eliminazione directory Marker: {e}")
         
-        result_text = glm_ocr(pdf_path)
-        
-        # Salva il risultato del fallback
-        fallback_dir = os.path.join(output_dir, base_name)
-        os.makedirs(fallback_dir, exist_ok=True)
-        fallback_path = os.path.join(fallback_dir, base_name + ".md")
-        with open(fallback_path, "w", encoding="utf-8") as f:
-            f.write(result_text)
+        marker_text = glm_ocr(pdf_path)
+    else:
+        # LOGICA IBRIDA: Cerca tabelle
+        table_data = get_table_data(base_output_dir)
+        if table_data:
+            table_pages = sorted(list(table_data.keys()))
+            # Raggruppa pagine consecutive con tabelle
+            groups = []
+            if table_pages:
+                current_group = [table_pages[0]]
+                for i in range(1, len(table_pages)):
+                    # Raggruppa pagine consecutive con un limite massimo di 3 per blocco
+                    if table_pages[i] == table_pages[i-1] + 1 and len(current_group) < MAX_PAGES_TABLE_OCR:
+                        current_group.append(table_pages[i])
+                    else:
+                        groups.append(current_group)
+                        current_group = [table_pages[i]]
+                groups.append(current_group)
+
+            ocr_results = {}
+            for group in groups:
+                # Se il gruppo ha più di una pagina, le scannerizziamo assieme
+                text_result = glm_ocr(pdf_path, target_page_indices=group, table_bboxes=table_data)
+                if isinstance(text_result, dict): # Fallback se glm_ocr restituisce dict di pagine singole
+                    for idx, t in text_result.items(): ocr_results[idx] = ([idx], t)
+                else:
+                    ocr_results[group[0]] = (group, text_result)
             
+            marker_text = assemble_hybrid_markdown(marker_text, ocr_results)
+            
+            # Salva il file ibrido finale
+            hybrid_path = os.path.join(base_output_dir, base_name + ".md")
+            with open(hybrid_path, "w", encoding="utf-8") as f:
+                f.write(marker_text)
+            print(f"✅ Documento ibrido generato: {hybrid_path}")
+
+    return marker_text
+        
+    # Salva il risultato del fallback
+    fallback_dir = os.path.join(output_dir, base_name)
+    os.makedirs(fallback_dir, exist_ok=True)
+    fallback_path = os.path.join(fallback_dir, base_name + ".md")
+    with open(fallback_path, "w", encoding="utf-8") as f:
+        f.write(result_text)
+        
     return result_text
 
 

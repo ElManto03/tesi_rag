@@ -1,65 +1,39 @@
 services:
   ollama:
     image: ollama/ollama
+    container_name: ollamone
     ports:
-      - "11434:11434" # Mappa la porta del container su Windows
+      - "11434:11434"
+    shm_size: '2gb' # Il fix per non far bloccare l'OCR alla terza pagina
     volumes:
-      - /root/.ollama
-  claude-router:
-    build:
-      context: .
-      dockerfile: Dockerfile # Punta al file appena creato
+      - ollama_vecchio:/root/.ollama
+    # AGGIUNTA FONDAMENTALE: Passa la GPU NVIDIA a Docker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+  postgres_vector:
+    image: pgvector/pgvector:pg16
+    container_name: postgres_vector
+    hostname: d28097d83439
     ports:
-      - "3456:3456" # Espone il router su Windows alla porta 3456
+      - "5432:5432"
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434 # Dice al router come parlare con Ollama
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_DB=vector_db
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD="RAGatha42"
+      - PGDATA=/var/lib/postgresql/data
     volumes:
-      - ./config-router:/root/.claude-code-router
-      - .:/workspace
-    tty: true
-    stdin_open: true
-    depends_on:
-      - ollama
-  # server:
-  #   build:
-  #     context: .
-  #   ports:
-  #     - 8001:8001
-  #   environment:
-  #     - POSTGRES_SERVER=db
-  #     - POSTGRES_USER=postgres
-  #     - POSTGRES_DB=example
-  #     - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #   secrets:
-  #     - db-password
-  #   develop:
-  #     watch:
-  #       - action: rebuild
-  #         path: .
-#   db:
-#     image: postgres:18
-#     restart: always
-#     user: postgres
-#     secrets:
-#       - db-password
-#     volumes:
-#       - db-data:/var/lib/postgresql
-#     environment:
-#       - POSTGRES_DB=example
-#       - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
-#     expose:
-#       - 5432
-#     healthcheck:
-#       test: ["CMD", "pg_isready"]
-#       interval: 10s
-#       timeout: 5s
-#       retries: 5
-# volumes:
-#   db-data:
-# secrets:
-#   db-password:
-#     file: db/password.txt
+      - "C:\\Users\\federico.mantoni\\Documents\\PostgreSQL/postgres_data:/var/lib/postgresql/data"
+    restart: "no"
+
+# FIX INDENTAZIONE: Adesso la struttura globale è corretta
+volumes:
+  ollama_vecchio:
+    external: true
+    name: ollama

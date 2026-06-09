@@ -10,6 +10,7 @@ import json
 import re
 import pysbd
 import io
+import numpy as np
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pypdf import PdfReader
@@ -21,6 +22,10 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core import Document, Settings
 from config import settings
 from PIL import ImageEnhance, Image
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+from docling.document_converter import DocumentConverter
+import ollama
+#from paddleocr import PaddleOCRVL
 
 # Configurazione cartella debug per immagini OCR
 DEBUG_DIR = "ocr_debug_images"
@@ -151,60 +156,236 @@ def chunk_splitter(doc, splitter, md_parser):
     if nodes: print(f"Primo chunk generato: {nodes[0].get_content()[:100]}...")
     return nodes
 
-def encode_image(img):
+def trova_punto_taglio_ottimale(image_path):
+    """
+    Trova la riga di pixel dell'immagine che contiene più del 40% di pixel neri 
+    più vicina alla metà della pagina. Assume l'immagine in B/N (0=nero).
+    """
+    img = Image.open(image_path).convert('L')
+    width, height = img.size
+    meta_altezza = height // 2
+    arr = np.array(img)
+    
+    # Poiché l'immagine è già in B/N, il nero ha valore 0.
+    # Calcoliamo la percentuale di pixel neri (valore 0) per ogni riga.
+    percentuale_nero = np.mean(arr < 100, axis=1)
+    
+    # Filtriamo le righe che hanno una densità di nero superiore al 40% SOLO sotto la metà
+    indici_sotto_meta = np.where((percentuale_nero > 0.40) & (np.arange(height) > meta_altezza))[0]
+    
+    if len(indici_sotto_meta) > 0:
+        # Scegliamo la riga più vicina alla metà (il valore minimo tra gli indici che sono già > meta_altezza)
+        punto_taglio = np.min(indici_sotto_meta)
+    else:
+        # Fallback: se nessuna riga supera il 40%, usiamo quella con la densità massima rilevata
+        punto_taglio = np.argmax(percentuale_nero)
+        
+    return int(punto_taglio)
+
+def pipeline_taglio_intelligente(image_path, altezza_soglia_critica=1440):
+    """
+    Decide se tagliare l'immagine e, in caso positivo, esegue il taglio
+    in un punto sicuro senza tranciare il testo.
+    """
+    img = Image.open(image_path)
+    width, height = img.size
+    
+    # CRITERIO DEL SE: Tagliamo solo se supera la soglia critica per la VRAM
+    if height <= altezza_soglia_critica:
+        print(f"Immagine sicura (Altezza: {height}px). Nessun taglio necessario.")
+        return [image_path]
+    
+    print(f"Immagine troppo grande ({height}px). Ricerca del punto di taglio sicuro...")
+    
+    # CRITERIO DEL DORE: Trova la riga di testo vuota
+    riga_taglio = trova_punto_taglio_ottimale(image_path)
+    print(f"Punto di taglio sicuro individuato alla riga: {riga_taglio}")
+    
+    # Eseguiamo il crop anatomico
+    meta_top = img.crop((0, 0, width, riga_taglio))
+    meta_bottom = img.crop((0, riga_taglio, width, height))
+    
+    path_top = "output_pagina_top.jpg"
+    path_bottom = "output_pagina_bottom.jpg"
+    
+    meta_top.save(path_top, "JPEG", quality=95)
+    meta_bottom.save(path_bottom, "JPEG", quality=95)
+    
+    return [path_top, path_bottom]
+
+def encode_image(img_or_path):
     """Ottimizza e codifica un oggetto PIL Image in base64."""
+    if isinstance(img_or_path, str):
+        img = Image.open(img_or_path)
+    else:
+        img = img_or_path
+
+    target_width = 1000
+    if img.width > target_width:
+        w_percent = (target_width / float(img.width))
+        h_size = int((float(img.height) * float(w_percent)))
+        img = img.resize((target_width, h_size), Image.Resampling.LANCZOS)
     grayscale_img = img.convert('L')
     enhancer = ImageEnhance.Contrast(grayscale_img)
-    optimized_img = enhancer.enhance(1.3)
-    img_byte_arr = io.BytesIO()
-    optimized_img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
-    return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+    optimized_img = enhancer.enhance(1.4)
+    #img_byte_arr = io.BytesIO()
+    #optimized_img.save(img_byte_arr, format='JPEG', quality=95, optimize=True)
+    # return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+
+    # Assicura che la directory di destinazione esista
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    # Genera un percorso univoco per il salvataggio
+    save_path = os.path.join(DEBUG_DIR, f"optimized_{int(time.time() * 1000)}.jpg")
+
+    # Salva l'immagine ottimizzata
+    optimized_img.save(save_path, format='JPEG', quality=95, optimize=True)
+
+    return save_path
 
 # --- CONFIGURAZIONE OCR OLLAMA ---
-TABLE_OCR_OPTIONS = {"num_ctx": 12288, "temperature": 0.0, "num_predict": 8192}
+TABLE_OCR_OPTIONS = {"num_ctx": 4096,  "temperature": 0.0001, "num_predict": 4096}
 PAGE_OCR_OPTIONS = {"num_ctx": 16384, "num_predict": 4096, "temperature": 0.2, "repeat_penalty": 1.3}
 
 #Se una cella di una colonna è unita verticalmente e si applica a più punti elenco di un'altra colonna, devi sdoppiare la cella e RIPETERE il testo per ogni singola riga corrispondente.
+CORRECTION_MODEL = "qwen2.5:14b-instruct-q4_K_M"
 
-TABLE_OCR_PROMPT = """Tu sei un OCR visivo di altissima precisione, specializzato nella ricostruzione di tabelle ministeriali che si estendono su più pagine. L'immagine che ricevi contiene diverse pagine incollate verticalmente.
+def _call_normalization_llm(chunk_text):
+    """Esegue la chiamata all'LLM per la normalizzazione del testo Markdown."""
+    correction_prompt = f"""
+Tu sei un sistema di post-processing algoritmico per motori di Document Layout Analysis (DLA). 
+Ricevi in input un frammento di testo (circa 3 pagine) in formato Markdown estratto da un documento. A causa dei cambi pagina, le tabelle potrebbero apparire spezzate o frammentate.
 
-Il tuo obiettivo è generare un UNICO output Markdown continuo, fondendo le tabelle delle diverse pagine in una sola struttura senza interruzioni.
+Il tuo obiettivo è normalizzare, ricostruire e consolidare la struttura logica del documento, restituendo un Markdown pulito e privo di rumore, ottimizzato per un sistema RAG.
+
+Segui tassativamente queste linee guida ingegneristiche e universali:
+
+1. IDENTIFICAZIONE E FUSIONE DELLE TABELLE SPEZZATE:
+- Se una tabella si interrompe a causa di un cambio pagina e riprende poco dopo (riconoscibile dalla ripetizione delle stesse intestazioni di colonna o dalla continuazione logica delle righe), fondile in un'unica tabella Markdown.
+- Elimina le intestazioni duplicate e i separatori di tabella (`|---|---|`) intermedi generati dal cambio pagina.
+
+2. RISOLUZIONE DEI TRONCAMENTI SINTATTICI (SALDATURA DEL TESTO):
+- Analizza la fine di ogni riga e l'inizio della successiva. Se una parola o una frase è chiaramente troncata a metà da un a capo, salda i due frammenti eliminando i trattini di sillabazione.
+
+3. PROPAGAZIONE DELLE CELLE UNITE VERTICALMENTE (SPANNING):
+- Se rilevi che una cella contiene dati strutturati importanti e le righe immediatamente successive presentano celle corrispondenti vuote (o contenenti solo spazi/simboli come '//'), propaga logicamente quel contesto. Puoi scegliere di duplicare il testo nelle righe successive oppure di consolidare tutte le sotto-infrazioni in un'unica macro-riga, separando i punti elenco interni esclusivamente con il tag HTML <br> per non rompere la riga della tabella Markdown.
+
+4. ELIMINAZIONE DEL RUMORE DI PAGINA (STRIPPING):
+- Riconosci e rimuovi completamente metadati ripetitivi che interrompono il flusso logico: numeri di pagina, intestazioni di pagina (header), piè di pagina (footer), indirizzi istituzionali, stringhe di protocollo e tag di annotazione delle immagini (es. ``).
+
+5. PRESERVAZIONE DEL TESTO NON TABELLARE:
+- Se il documento contiene paragrafi di testo normale, preservali esattamente nella loro posizione sequenziale originaria.
+
+6. TRASFORMAZIONE DI ELENCHI IN TABELLE CONTINUATIVE:
+- Se dopo una tabella incontri dei titoli seguiti da elenchi puntati o checkbox (□), comprendi che si tratta della continuazione logica della tabella precedente che il parser ha rotto.
+- Converti questi elenchi in righe della tabella precedente. 
+- Associa a ciascuna di queste nuove categorie i valori delle celle precedenti, senza lasciare celle vuote
+
+7. RIMOZIONE DELLE INTESTAZIONI:
+- All'inizio di ogni blocco di testo, se trovi un'intestazione che contiene il numero di telefono o il codice fiscale della scuola (82007870403), rimuovila completamente insieme a eventuali righe adiacenti che contengono informazioni di contatto o indirizzi.
+
+OUTPUT RICHIESTO:
+Restituisci esclusivamente l'intero documento normalizzato in Markdown. Non includere alcuna introduzione, alcuna spiegazione e nessun commento discorsivo (es. NON scrivere "Ecco la tabella strutturata:"). Inizia direttamente con il primo elemento valido del documento.
+
+Ecco il testo grezzo da elaborare:
+{chunk_text}
+"""
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/chat",
+            json={
+                "model": CORRECTION_MODEL,
+                "messages": [{"role": "user", "content": correction_prompt}],
+                "stream": False,
+                "options": {"num_ctx": 32768, "temperature": 0.1}
+            },
+            timeout=600
+        )
+        resp.raise_for_status()
+        return resp.json().get("message", {}).get("content", "").strip()
+    except Exception as e:
+        print(f"⚠️ Errore normalizzazione LLM: {e}")
+        return chunk_text
+
+def llm_normalize_markdown(md_text, separator_pattern, pages_per_chunk=3):
+    """Divide il markdown in blocchi e chiama l'LLM per la normalizzazione."""
+    print(f"--- 🚀 Normalizzazione LLM ({CORRECTION_MODEL}) ---")
+    md_text = re.sub(r'<!--\s*image\s*-->', '', md_text)
+    matches = list(re.finditer(separator_pattern, md_text, re.MULTILINE | re.IGNORECASE))
+    if not matches:
+        return _call_normalization_llm(md_text)
+    final_text = ""
+    if matches[0].start() > 0:
+        final_text += md_text[:matches[0].start()].strip() + "\n\n"
+    for i in range(0, len(matches), pages_per_chunk):
+        start_pos = matches[i].start()
+        end_pos = matches[i + pages_per_chunk].start() if i + pages_per_chunk < len(matches) else len(md_text)
+        chunk_text = md_text[start_pos:end_pos]
+        if not chunk_text.strip(): continue
+        print(f"🔧 Elaborazione blocco di pagine partendo da {matches[i].group(0).strip()}...")
+        corrected_chunk = _call_normalization_llm(chunk_text)
+        page_tag = matches[i].group(0).strip()
+        if not re.match(r'\{\d+\}-+', page_tag):
+            page_idx_match = re.search(r'(\d+)', page_tag)
+            page_idx = page_idx_match.group(1) if page_idx_match else i
+            page_tag = f"{{{page_idx}}}------------------------------------------------"
+        final_text += page_tag + "\n\n" + corrected_chunk + "\n\n"
+    requests.post("http://localhost:11434/api/generate", json={"model": CORRECTION_MODEL, "keep_alive": 0})
+    return final_text
+
+TABLE_OCR_PROMPT = """Tu sei un OCR visivo di altissima precisione. Il tuo compito è convertire l'immagine di questa tabella complessa in formato Markdown pulito e strutturato.
 
 Segui queste istruzioni tassative:
 
-1. TRASCRIZIONE DEI TITOLI:
-Inizia trascrivendo fedelmente i titoli presenti in cima alla prima pagina. Usa la formattazione Markdown standard (## o **).
+1. VIETATO RIASSUMERE O PARAFRASARE: Non ottimizzare il testo, non accorciare le frasi e non cambiare le parole (es. se c'è scritto 'collegamento internet per motivi personali, non di studio e ricerca', NON devi scrivere 'internet per motivi non scolastici'). Devi copiare ogni singola parola, inclusi gli articoli e le congiunzioni, carattere per carattere. Se accorci una frase, l'output è considerato ERRORE.
 
-2. FUSIONE DELLE TABELLE (Regola d'oro):
-Genera una SOLA tabella Markdown per l'intero documento. 
-- Quando scendi nell'immagine e incontri nuovamente la riga di intestazione all'inizio della seconda pagina, NON trascriverla.
-- Ignora i margini fisici tra le pagine e continua ad aggiungere le righe della seconda pagina direttamente sotto quelle della prima.
-- Se l'ultima cella della prima pagina e la prima cella della seconda pagina appartengono alla stessa categoria (es. lo stesso Dovere), saldale logicamente.
+2. TRASCRIZIONE DEI TITOLI E DEL CONTESTO:
+Inizia trascrivendo fedelmente i titoli o i testi esplicativi presenti sopra la tabella usando la formattazione Markdown standard (## o ###).
 
-3. REGOLE DI FORMATTAZIONE INTERNA:
-- PUNTI ELENCO: All'interno delle celle (colonna INFRAZIONI), separa i punti elenco esclusivamente con il tag HTML <br> per non rompere la riga Markdown.
-- CELLE UNITE VERTICALMENTE: Trascrivi il testo della cella unita (es. "SANZIONE G)", "Dirigente scolastico") solo nella prima riga in cui compare. Nelle righe successive di quella stessa cella (anche se passano alla pagina successiva), inserisci il simbolo // (oppure lascia vuoto ||).
+3. REGOLE DI STRUTTURA DELLA TABELLA (Uso del <br> per elenchi):
+- È tassativamente vietato l'uso di elenchi puntati all'interno della tabella, sia usando la sintassi Markdown (- o *), sia usando tag HTML (<ul>, <li>).
+- Se una cella contiene più punti elenco, frasi distinte o sotto-voci, trascrivili tutti all'interno della STESSA cella, separando ogni punto esclusivamente con il tag HTML <br> per andare a capo senza rompere la riga Markdown.
+- GESTIONE DELLE CELLE UNITE VERTICALMENTE: Se una macro-categoria si applica a un intero blocco di elementi, crea un'unica grande riga Markdown. Inserisci tutti gli elementi corrispondenti nella cella adiacente separati da <br>, in modo che rimangano perfettamente allineati visivamente con le rispettive colonne di riferimento.
 
-4. NOTE E FOOTER:
-Dopo aver chiuso la tabella con l'ultima riga, trascrivi fedelmente eventuali note in calce, legende o avvertenze presenti in fondo all'immagine (es. le note che iniziano con "*" o "N.B.").
+4. REGOLE DI RIGORE PER L'OUTPUT:
+- Inizia direttamente con il primo titolo o riga di testo rilevata in alto.
+- NON inserire introduzioni, saluti, commenti discorsivi o spiegazioni del tipo "Ecco la tabella convertita". Restituisci ESCLUSIVAMENTE l'output in Markdown.
+- Sii un OCR letterale: trascrivi ogni stringa esattamente come appare visivamente, senza riassumere, omettere o parafrasare il testo."""
+PAGE_OCR_PROMPT = """Trascrivine il contenuto in Markdown standard.
+Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella e uniscila ad essa.
+Se vedi parti di tabella che hanno una sola riga e colonna, trasformali in un elenco puntato.
+Se vedi parti di tabella con una sola colonna e una sola parola al suo interno, trasformalo in un titolo.
+Assicurati di scrivere tutto il testo nelle tabelle, se non riesci a dividere correttamente una riga di una tabella, trasformala in un paragrafo normale ma mantieni il testo.
+Mantieni titoli e strutture. Solo testo Markdown, no commenti."""
 
-REGOLE DI RIGORE:
-- Inizia direttamente con il primo titolo in alto.
-- NON inserire commenti discorsivi o etichette come "Fase 1" o "Tabella unita".
-- Sii un OCR letterale: trascrivi ogni parola esattamente come appare, senza correggere o riassumere."""
-
-def _call_ollama_ocr(img_str, prompt, options):
+def _call_ollama_ocr(image, prompt, options):
     """Centralizza la chiamata a Ollama per ridurre la duplicazione e gestire la VRAM."""
     headers = {"Connection": "close"}
     try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "qwen2.5vl:7b", "images": [img_str], "prompt": prompt, "stream": False, "options": options},
-            headers=headers, timeout=300
+        print("inizio chiamata OCR Ollama...")
+        
+        response = ollama.chat(
+            model='qwen2.5vl:3b',
+            messages=[{
+                'role': 'user',
+                'content': prompt,
+                'images': [image],
+                'options': options
+            }]
         )
-        response.raise_for_status()
-        text = response.json().get("response", "").strip()
-        requests.post("http://localhost:11434/api/generate", json={"model": "qwen2.5vl:7b", "keep_alive": 0})
+        # response = requests.post(
+        #     "http://localhost:11434/api/chat",
+        #     json={
+        #         "model": "richardyoung/olmocr2:7b-q8",
+        #         "prompt": prompt,
+        #         "images": [image],
+        #         "stream": False,
+        #         "options": options
+        #     },
+        #     headers=headers, timeout=300
+        # )
+        #response.raise_for_status()
+        text = (response['message']['content']).strip()
+        requests.post("http://localhost:11434/api/generate", json={"model": "qwen2.5vl:3b", "keep_alive": 0})
         return clean_junk_text(text)
     except Exception as e:
         print(f"❌ Errore OCR Ollama: {e}")
@@ -443,11 +624,41 @@ def run_marker_pdf(pdf_path, output_dir):
         print("Errore: file non trovato.")
     return None
 
-def glm_ocr(pdf_path, target_page_indices=None, table_bboxes=None, section_headers=None):
+def run_docling_pdf(pdf_path, output_dir):
+    """Esegue l'elaborazione del PDF utilizzando Docling per una conversione accurata in Markdown."""
+    pdf_path = os.path.abspath(pdf_path)
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    base_output_dir = os.path.join(output_dir, base_name)
+    os.makedirs(base_output_dir, exist_ok=True)
+    output_path = os.path.join(base_output_dir, base_name + ".md")
+
+    print(f"--- 🚀 Avvio Docling Document Converter: {pdf_path} ---")
+    try:
+        converter = DocumentConverter()
+        result = converter.convert(pdf_path)
+        md_text = result.document.export_to_markdown()
+        
+        # Utilizziamo la funzione refactorizzata per normalizzare l'output di Docling
+        # Usiamo il CF della scuola come separatore di pagina proxy per Docling
+        final_corrected_text = llm_normalize_markdown(md_text, r'.*82007870403.*', pages_per_chunk=3)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(final_corrected_text)
+
+        print(f"✅ Docling (e correzione a blocchi) completata: {output_path}")
+        return final_corrected_text
+    except Exception as e:
+        print(f"❌ Errore durante l'elaborazione con Docling: {e}")
+        return None
+
+def glm_ocr(pdf_path, target_page_indices=None):
     print(f"--- 🚨 Avvio Vision-OCR (Qwen2.5-VL) ---")
     poppler_path = r"C:\Users\federico.mantoni\AppData\Local\miniconda3\envs\tesi2\Library\bin"
     
-    if target_page_indices is not None:
+    target_indices_provided = target_page_indices is not None
+    current_options = TABLE_OCR_OPTIONS if target_indices_provided else PAGE_OCR_OPTIONS
+    
+    if target_indices_provided:
         first = min(target_page_indices) + 1
         last = max(target_page_indices) + 1
         pages_list = convert_from_path(pdf_path, 180, first_page=first, last_page=last, poppler_path=poppler_path)
@@ -457,102 +668,38 @@ def glm_ocr(pdf_path, target_page_indices=None, table_bboxes=None, section_heade
         page_map = {i: p for i, p in enumerate(pages_list)}
         target_page_indices = sorted(list(page_map.keys()))
     
-     # LOGICA DI STITCHING PER TABELLE SPEZZATE
-    if table_bboxes and len(target_page_indices) > 1:
-        print(f"🧩 Stitching di {len(target_page_indices)} pagine per OCR unificato...")
-        crops = []
-        reader = PdfReader(pdf_path)
-
-        for i in target_page_indices:
-            img = page_map[i]
-            img_w, img_h = img.size
-            
-
-            # Calcolo scala tra punti PDF (da blocks.json) e pixel immagine
-            page_points_h = float(reader.pages[i].mediabox.height)
-            scale_factor = img_h / page_points_h
-
-            top_y_px = int(img_h * 0.18)
-            bottom_y_px = int(img_h * 0.95)
-
-            # Logica di ritaglio basata sulla posizione nel gruppo e presenza titoli
-            if section_headers and i in section_headers:
-                header_y_px = int(section_headers[i] * scale_factor)
-                # Se è l'ultima pagina del gruppo (e non è l'unica), prendiamo la parte SOPRA il titolo
-                if i == target_page_indices[-1] and len(target_page_indices) > 1:
-                    bottom_y_px = max(top_y_px, header_y_px - 10)
-                    print(f"✂️ Taglio FINE gruppo a Y={bottom_y_px}px (Pagina {i+1})")
-                # Se è la prima pagina del gruppo, prendiamo la parte SOTTO il titolo
-                elif i == target_page_indices[0]:
-                    top_y_px = max(0, header_y_px - 10)
-                    print(f"✂️ Taglio INIZIO gruppo a Y={top_y_px}px (Pagina {i+1})")
-
-            crop_box = (
-                0,                      # Prendi tutta la larghezza da sinistra              # Inizio tabella rilevato o fallback
-                top_y_px,
-                img_w,                  # Fino a destra     # Salta il piè di pagina in basso
-                bottom_y_px
-            )
-            crops.append(img.crop(crop_box))
-        
-        if crops:
-            total_w = max(c.width for c in crops)
-            total_h = sum(c.height for c in crops)
-            stitched = Image.new('RGB', (total_w, total_h), (255, 255, 255))
-            curr_y = 0
-            for c in crops:
-                stitched.paste(c, (0, curr_y))
-                curr_y += c.height
-            
-            # Salvataggio debug dell'immagine unita
-            debug_path = os.path.join(DEBUG_DIR, f"stitched_p{target_page_indices[0]+1}_to_p{target_page_indices[-1]+1}.jpg")
-            stitched.save(debug_path, "JPEG")
-            
-            img_str = encode_image(stitched)
-            output = _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
-            time.sleep(2)
-            return output
-
+    # Logica semplice: processa ogni pagina singolarmente
     results_dict = {}
 
     # Processo sequenziale delle pagine
     target_pages = [(i, page_map[i]) for i in target_page_indices]
     for i, page in target_pages:
-        # Salvataggio debug dell'immagine della singola pagina
+        # Crop: 18% in alto, 95% in basso (rimuove header e footer)
+        w, h = page.size
+        left, top, right, bottom = 0, int(h * 0.18), w, int(h * 0.95)
+        page = page.crop((left, top, right, bottom))
+
+        # Salvataggio debug dell'immagine croppata
         debug_path = os.path.join(DEBUG_DIR, f"page_{i+1}.jpg")
         page.save(debug_path, "JPEG")
-        
-        # Anche per pagine singole applichiamo il taglio se è l'inizio di una sezione
-        if section_headers and i in section_headers and len(target_page_indices) == 1:
-            img_w, img_h = page.size
-            reader = PdfReader(pdf_path)
-            scale_factor = img_h / float(reader.pages[i].mediabox.height)
-            header_y_px = int(section_headers[i] * scale_factor)
-            # Per singola pagina con titolo, assumiamo di voler la tabella che inizia lì
-            page = page.crop((0, max(0, header_y_px - 10), img_w, int(img_h * 0.95)))
 
         img_str = encode_image(page)
-        prompt = (
-            f"Questa immagine rappresenta la pagina {i+1} del documento. Trascrivine il contenuto in Markdown standard. "
-            "Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella e uniscila ad essa."
-            "Se vedi parti di tabella che hanno una sola riga e colonna, trasformali in un elenco puntato."
-            "Se vedi parti di tabella con una sola colonna e una sola parola al suo interno, trasformalo in un titolo"
-            "Assicurati di scrivere tutto il testo nelle tabelle, se non riesci a dividere correttamente una riga di una tabella, trasformala in un paragrafo normale ma mantieni il testo."
-            "Mantieni titoli e strutture. Solo testo Markdown, no commenti."
-        )
+        prompt = TABLE_OCR_PROMPT if target_indices_provided else PAGE_OCR_PROMPT
 
-        testo_pagina = _call_ollama_ocr(img_str, prompt, PAGE_OCR_OPTIONS)
+        testo_pagina = _call_ollama_ocr([img_str], prompt, current_options)
         if testo_pagina:
             results_dict[i] = testo_pagina
             print(f"✅ Pagina {i+1} completata.")
             time.sleep(2)
         else:
             results_dict[i] = f"[Errore OCR Pagina {i+1}]"
-    if target_page_indices is not None:
+    if target_indices_provided:
         return results_dict
 
     sorted_indices = sorted(results_dict.keys())
-    full_text = "\n\n".join([results_dict[i] for i in sorted_indices])
+    full_text = ""
+    for i in sorted_indices:
+        full_text += f"\n\n{{{i}}}------------------------------------------------\n" + results_dict[i]
     return full_text.strip()
 
 def ocr_single_image(image_path):
@@ -560,33 +707,47 @@ def ocr_single_image(image_path):
     print(f"🖼️ Esecuzione OCR su immagine: {image_path}")
     img = Image.open(image_path)
     img_str = encode_image(img)
-    return _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
+    # 1. Pipeline di taglio intelligente: decide se l'immagine va frammentata
+    image_parts = pipeline_taglio_intelligente(image_path)
+    
+    ocr_texts = []
+    for part_path in image_parts:
+        # 2. Codifica e chiamata OCR per ogni parte (singolarmente come richiesto)
+        img_str = encode_image(part_path)
+        text = _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
+        if text:
+            ocr_texts.append(text)
+        
+        # 3. Pulizia file temporanei se sono stati generati dal crop
+        if part_path != image_path:
+            try: os.remove(part_path)
+            except: pass
+            
+    return "\n\n".join(ocr_texts).strip()
+    #return _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
 
 def get_table_data(base_output_dir):
-    """Analizza blocks.json di Marker per trovare pagine con tabelle e le loro bounding box."""
+    """Analizza blocks.json di Marker per trovare pagine con tabelle."""
     blocks_path = os.path.join(base_output_dir, "blocks.json")
     if not os.path.exists(blocks_path):
-        return {}, {}
+        return set(), set()
     
-    table_data = {} # page_id -> list of bboxes
-    list_group_data = {} # page_id -> list of bboxes (tipo 6)
+    table_pages = set()
+    list_group_pages = set()
     page_top_level_blocks = {} # page_id -> primi blocchi della pagina
-    section_headers = {} # page_id -> coordinata Y del primo header trovato
+    section_headers = set() # page_id dove è presente un titolo tabella
 
     def find_data_recursive(blocks):
         for block in blocks:
             b_type = str(block.get("block_type", "")).lower()
             b_desc = str(block.get("block_description", "")).lower()
             pid = block.get("page_id")
-            bbox = block.get("polygon", {}).get("bbox")
             b_text = str(block.get("text", ""))
             
             # Rilevamento Header/Titoli per definire i confini dei blocchi OCR
             # Il titolo deve contenere la parola "tab" (es. Tabella, Tab.) per essere considerato un punto di interruzione
-            if ("section header" in b_desc or "title" in b_desc or b_type == "2") and ("TAB." in b_text or "TABELLA " in b_text or "CAPO " in b_text) and pid is not None and bbox:
-                y_top = bbox[1]
-                if pid not in section_headers or y_top < section_headers[pid]:
-                    section_headers[pid] = y_top
+            if ("section header" in b_desc or "title" in b_desc or b_type == "2") and ("TAB." in b_text or "TABELLA " in b_text or "CAPO " in b_text) and pid is not None:
+                section_headers.add(pid)
 
             # Se è un blocco pagina (tipo 8), salviamo i suoi figli diretti per l'euristica
             if b_type == "8" and pid is not None:
@@ -594,17 +755,13 @@ def get_table_data(base_output_dir):
 
             # Monitoriamo tipi 27 (Table) e 24 (TOC) che spesso contengono i dati strutturati
             if "table" in b_desc or "table" in b_type or b_type in ["27", "24"]:
-                if pid is not None and bbox:
-                    if pid not in table_data:
-                        table_data[pid] = []
-                    table_data[pid].append(bbox)
+                if pid is not None:
+                    table_pages.add(pid)
             
             # Monitoriamo i List Group (tipo 6) per l'euristica di continuità
             if b_type == "6" or "list group" in b_desc:
-                if pid is not None and bbox:
-                    if pid not in list_group_data:
-                        list_group_data[pid] = []
-                    list_group_data[pid].append(bbox)
+                if pid is not None:
+                    list_group_pages.add(pid)
             
             # Esplora ricorsivamente i figli se presenti (chiave 'children' in Marker)
             children = block.get("children")
@@ -622,7 +779,7 @@ def get_table_data(base_output_dir):
         sorted_pids = sorted(list(page_top_level_blocks.keys()))
         for pid in sorted_pids:
             next_pid = pid + 1
-            if pid in list_group_data and next_pid in page_top_level_blocks:
+            if pid in list_group_pages and next_pid in page_top_level_blocks:
                 # Controlla se nei primi 8 elementi della pagina successiva c'è una tabella
                 has_early_table = False
                 for b in page_top_level_blocks[next_pid][:8]:
@@ -634,42 +791,30 @@ def get_table_data(base_output_dir):
                 
                 if has_early_table:
                     print(f"🔗 Euristica: Pagina {pid+1} (List Group) collegata a Tabella in Pagina {next_pid+1}")
-                    if pid not in table_data:
-                        table_data[pid] = []
-                    # Aggiungiamo i bbox dei list group come se fossero tabelle per forzare il crop
-                    table_data[pid].extend(list_group_data[pid])
+                    table_pages.add(pid)
 
     except Exception as e:
         print(f"⚠️ Errore lettura blocks.json: {e}")
-    return table_data, section_headers
+    return table_pages, section_headers
 
 def assemble_hybrid_markdown(marker_md, ocr_results):
     """
     Sostituisce le pagine testuali di Marker con l'output Vision OCR.
-    ocr_results: { start_page_idx: (lista_pagine, testo_ocr) }
+    ocr_results: { page_idx: testo_ocr }
     """
     page_pattern = r'(\{\d+\}-+)'
     parts = re.split(page_pattern, marker_md)
     
     assembled = [parts[0]]
-    skip_until_page = -1
-    
     for i in range(1, len(parts), 2):
         tag = parts[i]
         content = parts[i+1] if (i+1) < len(parts) else ""
-        
         page_match = re.search(r'\{(\d+)\}', tag)
         if not page_match: continue
         current_page_idx = int(page_match.group(1))
-
-        if current_page_idx <= skip_until_page:
-            continue # Salta le pagine che sono state accorpate in un gruppo OCR precedente
-            
         if current_page_idx in ocr_results:
-            pages_group, text = ocr_results[current_page_idx]
-            print(f"🔄 Ibridazione: Inserimento blocco OCR per pagine {pages_group}")
-            assembled.append(tag + "\n" + text)
-            skip_until_page = max(pages_group)
+            print(f"🔄 Ibridazione: Sostituzione pagina {current_page_idx + 1} con output Vision OCR.")
+            assembled.append(tag + "\n" + ocr_results[current_page_idx])
         else:
             assembled.append(tag + content)
     return "".join(assembled)
@@ -680,74 +825,40 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
     
     if force_ocr:
         print("--- 🚨 OCR forzata: Avvio GLM-OCR ---")
-        # Se l'OCR è forzata, bypassa Marker e vai direttamente a glm_ocr
         result_text = glm_ocr(pdf_path)
-        # Salva il risultato del fallback anche quando forzato
-        fallback_dir = os.path.join(output_dir, base_name)
-        os.makedirs(fallback_dir, exist_ok=True)
-        fallback_path = os.path.join(fallback_dir, base_name + ".md")
-        with open(fallback_path, "w", encoding="utf-8") as f:
+        # Normalizzazione LLM
+        result_text = llm_normalize_markdown(result_text, r'\{\d+\}-+', pages_per_chunk=3)
+        os.makedirs(base_output_dir, exist_ok=True)
+        with open(os.path.join(base_output_dir, base_name + ".md"), "w", encoding="utf-8") as f:
             f.write(result_text)
         return result_text
 
-    # Prova prima con Marker
+    # Torniamo a Marker-PDF per estrazione testo e rilevamento tabelle (tramite blocks.json)
     marker_text = run_marker_pdf(pdf_path, output_dir)
-    
+
     if not marker_text or len(marker_text) < 100:
-        print("⚠️ Marker ha prodotto un risultato insufficiente. Attivo fallback Vision...")
-        if os.path.exists(base_output_dir):
-            try:
-                shutil.rmtree(base_output_dir)
-            except Exception as e:
-                print(f"⚠️ Errore eliminazione directory Marker: {e}")
-        
-        marker_text = glm_ocr(pdf_path)
-    else:
-        # LOGICA IBRIDA: Cerca tabelle
-        table_data, section_headers = get_table_data(base_output_dir)
-        if table_data:
-            table_pages = sorted(list(table_data.keys()))
-            # Raggruppa pagine consecutive con tabelle
-            groups = []
-            if table_pages:
-                current_group = []
-                for i in range(len(table_pages)):
-                    cp = table_pages[i]
-                    if not current_group:
-                        current_group.append(cp)
-                    else:
-                        prev = current_group[-1]
-                        # Se la pagina corrente ha un titolo, chiude il gruppo precedente (includendo il top di questa)
-                        # e inizia il nuovo gruppo (includendo il bottom di questa)
-                        if cp in section_headers:
-                            current_group.append(cp)
-                            groups.append(current_group)
-                            current_group = [cp]
-                        # Altrimenti, aggiungi se consecutiva e c'è spazio
-                        elif cp == prev + 1 and len(current_group) < MAX_PAGES_TABLE_OCR:
-                            current_group.append(cp)
-                        else:
-                            groups.append(current_group)
-                            current_group = [cp]
-                groups.append(current_group)
+        print("⚠️ Marker ha fallito o prodotto troppo poco testo. Fallback Vision-OCR totale...")
+        content = glm_ocr(pdf_path)
+        os.makedirs(base_output_dir, exist_ok=True)
+        with open(os.path.join(base_output_dir, base_name + ".md"), "w", encoding="utf-8") as f:
+            f.write(content)
+        return content
 
-            ocr_results = {}
-            for group in groups:
-                # Se il gruppo ha più di una pagina, le scannerizziamo assieme
-                text_result = glm_ocr(pdf_path, target_page_indices=group, table_bboxes=table_data, section_headers=section_headers)
-                if isinstance(text_result, dict): # Fallback se glm_ocr restituisce dict di pagine singole
-                    for idx, t in text_result.items(): ocr_results[idx] = ([idx], t)
-                else:
-                    ocr_results[group[0]] = (group, text_result)
+    # Logica Ibrida: cerca tabelle e usa OCR mirato per quelle pagine
+    table_pages, _ = get_table_data(base_output_dir)
+    if table_pages:
+        print(f"📊 Rilevate tabelle nelle pagine: {sorted(list(table_pages))}. Avvio OCR pagina per pagina...")
+        ocr_results = glm_ocr(pdf_path, target_page_indices=table_pages)
+        marker_text = assemble_hybrid_markdown(marker_text, ocr_results)
+        # Normalizzazione finale per il flusso Marker/Ibrido tramite LLM (3 pagine alla volta)
+        final_text = llm_normalize_markdown(marker_text, r'\{\d+\}-+', pages_per_chunk=3)
+        os.makedirs(base_output_dir, exist_ok=True)
+        final_path = os.path.join(base_output_dir, base_name + ".md")
+        with open(final_path, "w", encoding="utf-8") as f:
+            f.write(final_text)
+        print(f"✅ Documento finale (Ibrido + Normalizzazione LLM) generato: {final_path}")
             
-            marker_text = assemble_hybrid_markdown(marker_text, ocr_results)
-            
-            # Salva il file ibrido finale
-            hybrid_path = os.path.join(base_output_dir, base_name + ".md")
-            with open(hybrid_path, "w", encoding="utf-8") as f:
-                f.write(marker_text)
-            print(f"✅ Documento ibrido generato: {hybrid_path}")
-
+        return final_text
     return marker_text
 
 
@@ -837,7 +948,7 @@ def save_semantic_chunks(chunks, output_path):
         json.dump(chunks, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
-    input_path = r"ocr_debug_images\stitched_p5_to_p7.jpg"  # Sostituisci con il percorso reale del tuo file o cartella
+    input_path = r"ocr_debug_images\page_7.jpg"  # Sostituisci con il percorso reale del tuo file o cartella
     output_dir = "output_dir"
     metadata = {"access_level": "public", "module_option": "no"}  # Sostituisci con la logica reale per estrarre l'access level
     ensure_output_dir(output_dir)

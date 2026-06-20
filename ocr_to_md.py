@@ -10,8 +10,10 @@ import json
 import re
 import pysbd
 import io
+import hashlib
 import numpy as np
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pypdf import PdfReader
 from pdf2image import convert_from_path, pdfinfo_from_path
@@ -29,9 +31,10 @@ import ollama
 
 # Configurazione cartella debug per immagini OCR
 DEBUG_DIR = "ocr_debug_images"
-# if os.path.exists(DEBUG_DIR):
-#     shutil.rmtree(DEBUG_DIR)
-# os.makedirs(DEBUG_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+for f in os.listdir(DEBUG_DIR):
+    if f.startswith("optimized"):
+        os.remove(os.path.join(DEBUG_DIR, f))
 
 MAX_PAGES_TABLE_OCR = 4
 
@@ -156,62 +159,167 @@ def chunk_splitter(doc, splitter, md_parser):
     if nodes: print(f"Primo chunk generato: {nodes[0].get_content()[:100]}...")
     return nodes
 
-def trova_punto_taglio_ottimale(image_path):
+def trova_punto_taglio_ottimale(img_or_path):
     """
     Trova la riga di pixel dell'immagine che contiene più del 40% di pixel neri 
     più vicina alla metà della pagina. Assume l'immagine in B/N (0=nero).
     """
-    img = Image.open(image_path).convert('L')
+    if isinstance(img_or_path, str):
+        img = Image.open(img_or_path)
+    else:
+        img = img_or_path
+
+    img = img.convert('L')
     width, height = img.size
     meta_altezza = height // 2
     arr = np.array(img)
     
-    # Poiché l'immagine è già in B/N, il nero ha valore 0.
-    # Calcoliamo la percentuale di pixel neri (valore 0) per ogni riga.
-    percentuale_nero = np.mean(arr < 100, axis=1)
+    # 1. Identificazione righe con pixel neri consecutivi > 40% della riga
+    threshold_consecutive = int(0.4 * width)
+    is_black = arr < 100
     
-    # Filtriamo le righe che hanno una densità di nero superiore al 40% SOLO sotto la metà
-    indici_sotto_meta = np.where((percentuale_nero > 0.40) & (np.arange(height) > meta_altezza))[0]
+    # Algoritmo di raddoppio per trovare sequenze di lunghezza N in log(N) passi
+    res_consecutive = is_black.copy()
+    k_step = 1
+    while k_step * 2 <= threshold_consecutive:
+        res_consecutive[:, :-k_step] &= res_consecutive[:, k_step:]
+        k_step *= 2
+    remainder = threshold_consecutive - k_step
+    if remainder > 0:
+        res_consecutive[:, :-remainder] &= res_consecutive[:, remainder:]
     
+    has_long_sequence = np.any(res_consecutive[:, :max(1, width - threshold_consecutive + 1)], axis=1)
+    tutti_i_candidati = np.where(has_long_sequence)[0]
+
+    # Fallback: calcoliamo la densità totale per la ricerca della riga più nera se non ci sono linee lunghe
+    percentuale_nero = np.mean(is_black, axis=1)
+    
+    punto_taglio = None
+    
+    # 2. Filtriamo i candidati per quelli sotto la metà
+    indici_sotto_meta = tutti_i_candidati[tutti_i_candidati > meta_altezza]
     if len(indici_sotto_meta) > 0:
-        # Scegliamo la riga più vicina alla metà (il valore minimo tra gli indici che sono già > meta_altezza)
-        punto_taglio = np.min(indici_sotto_meta)
+        candidato = np.min(indici_sotto_meta)
+        # Se il punto selezionato sotto fa parte dell'ultimo 10%, cerchiamo invece sopra
+        if candidato < 0.9 * height:
+            punto_taglio = candidato
+
+    if punto_taglio is None:
+        # 3. Cerchiamo la riga più vicina alla metà partendo da sopra tra i candidati
+        indici_sopra_meta = tutti_i_candidati[tutti_i_candidati <= meta_altezza]
+        if len(indici_sopra_meta) > 0:
+            punto_taglio = np.max(indici_sopra_meta)
+
+    # 4. Ottimizzazione del punto di taglio risalendo blocchi contigui e cercando spazi bianchi
+    set_candidati = set(tutti_i_candidati)
+
+    # def risali_blocco(idx):
+    #     """Risale le righe contigue che superano la soglia del 40% di nero."""
+    #     while (idx - 1) in set_candidati:
+    #         idx -= 1
+    #     return idx
+
+    # if punto_taglio is not None and punto_taglio in set_candidati:
+    #     # Risaliamo il blocco del candidato attuale (procedura di sicurezza)
+    #     punto_taglio_r = risali_blocco(punto_taglio)
+
+    #     # Verifichiamo se esiste un candidato precedente separato da spazio bianco
+    #     pos_idx = np.searchsorted(tutti_i_candidati, punto_taglio_r)
+    #     if pos_idx > 0:
+    #         candidato_prec = tutti_i_candidati[pos_idx - 1]
+    #         candidato_prec = risali_blocco(candidato_prec)
+    #         if candidato_prec >= 10:
+    #             blocco_sopra = percentuale_nero[candidato_prec - 25 : candidato_prec]
+    #             if np.all(blocco_sopra < 0.05):
+    #                 # Se troviamo spazio bianco, prendiamo questo candidato e risaliamo il suo blocco
+    #                 punto_taglio = candidato_prec
+
+    # # 5. Verifica limiti di sicurezza (se il taglio è nel primo o ultimo 15%, non tagliare)
+    # if punto_taglio is not None:
+    #     if punto_taglio < 0.15 * height or punto_taglio > 0.85 * height:
+    #         return None
+            
+    # return int(punto_taglio+1) if punto_taglio is not None else None
+
+def croppa_su_testo_reale(img_or_path, tolleranza_bianco=250, margine_sicurezza=30):
+    """
+    Taglia l'immagine dove finisce il testo reale, ignorando le linee esterne
+    della tabella.
+    """
+    if isinstance(img_or_path, str):
+        img = Image.open(img_or_path)
     else:
-        # Fallback: se nessuna riga supera il 40%, usiamo quella con la densità massima rilevata
-        punto_taglio = np.argmax(percentuale_nero)
+        img = img_or_path
         
-    return int(punto_taglio)
+    img_gray = img.convert("L")
+    img_data = np.array(img_gray)
+
+    h, w = img_data.shape
+
+    # 1. Trova i pixel scuri
+    pixel_scuri = img_data < tolleranza_bianco
+
+    # 2. TRUCCO: Per ignorare le linee perimetrali superiore e inferiore,
+    # non analizziamo il 5% in alto e il 5% in basso dell'immagine.
+    bordo_v = int(h * 0.05)
+    
+    taglio_x = w
+    
+    # Scansioniamo da destra a sinistra
+    for x in range(w - 1, -1, -1):
+        # Prendiamo la colonna escludendo i bordi sopra e sotto
+        colonna_centrale = pixel_scuri[bordo_v : h - bordo_v, x]
+        
+        # Calcoliamo la densità: una linea verticale isolata (il bordo destro)
+        # colora quasi tutta la colonna. Il testo invece colora solo pochi pixel nella colonna.
+        somma_pixel = np.sum(colonna_centrale)
+        
+        if 7 < somma_pixel < (h * 0.3):
+            taglio_x = x + margine_sicurezza
+            break
+
+    # Evitiamo di rompere i limiti dell'immagine
+    taglio_x = min(max(taglio_x, int(w * 0.6)), w)
+
+    return img.crop((0, 0, taglio_x, h))
 
 def pipeline_taglio_intelligente(image_path, altezza_soglia_critica=1440):
     """
     Decide se tagliare l'immagine e, in caso positivo, esegue il taglio
     in un punto sicuro senza tranciare il testo.
     """
-    img = Image.open(image_path)
+    if isinstance(image_path, str):
+        img = Image.open(image_path)
+    else:
+        img = image_path
+
     width, height = img.size
     
     # CRITERIO DEL SE: Tagliamo solo se supera la soglia critica per la VRAM
     if height <= altezza_soglia_critica:
         print(f"Immagine sicura (Altezza: {height}px). Nessun taglio necessario.")
-        return [image_path]
+        return [img], False # Restituisce l'immagine intera e False per "was_split"
     
     print(f"Immagine troppo grande ({height}px). Ricerca del punto di taglio sicuro...")
     
     # CRITERIO DEL DORE: Trova la riga di testo vuota
-    riga_taglio = trova_punto_taglio_ottimale(image_path)
+    riga_taglio = trova_punto_taglio_ottimale(img)
+    if riga_taglio is None:
+        print("Taglio annullato: riga di taglio non trovata o troppo vicina ai bordi (limite 15%). Procedo con l'immagine intera.")
+        return [img], False # Restituisce l'immagine intera e False per "was_split"
     print(f"Punto di taglio sicuro individuato alla riga: {riga_taglio}")
     
     # Eseguiamo il crop anatomico
     meta_top = img.crop((0, 0, width, riga_taglio))
     meta_bottom = img.crop((0, riga_taglio, width, height))
-    
-    path_top = "output_pagina_top.jpg"
-    path_bottom = "output_pagina_bottom.jpg"
-    
-    meta_top.save(path_top, "JPEG", quality=95)
-    meta_bottom.save(path_bottom, "JPEG", quality=95)
-    
-    return [path_top, path_bottom]
+
+    # Applichiamo il crop orizzontale intelligente per ignorare i bordi tabella
+    meta_top = croppa_su_testo_reale(meta_top)
+    meta_bottom = croppa_su_testo_reale(meta_bottom)
+
+    meta_top.save("meta_top.png", format='PNG', quality=95, optimize=True)
+    meta_bottom.save("meta_bottom.png", format='PNG', quality=95, optimize=True)
+    return [meta_top, meta_bottom], True # Restituisce le parti tagliate e True per "was_split"
 
 def encode_image(img_or_path):
     """Ottimizza e codifica un oggetto PIL Image in base64."""
@@ -220,30 +328,45 @@ def encode_image(img_or_path):
     else:
         img = img_or_path
 
+    # target_width = 1176
+    # if img.width > target_width:
+    #     w_percent = (target_width / float(img.width))
+    #     h_size = int((float(img.height) * float(w_percent)))
+    #     w_safe = (target_width + 3) & ~3
+    #     h_safe = (h_size + 3) & ~3
+    #     img = img.resize((w_safe, h_safe), Image.Resampling.LANCZOS)
+
+
     target_width = 1000
     if img.width > target_width:
         w_percent = (target_width / float(img.width))
         h_size = int((float(img.height) * float(w_percent)))
         img = img.resize((target_width, h_size), Image.Resampling.LANCZOS)
+
+    #Aggiunge 30 righe di pixel bianchi sopra l'immagine
+    w, h = img.size
+    padded_img = Image.new(img.mode, (w, h + 60), "white")
+    padded_img.paste(img, (0, 30))
+    img = padded_img
+
     grayscale_img = img.convert('L')
     enhancer = ImageEnhance.Contrast(grayscale_img)
     optimized_img = enhancer.enhance(1.4)
-    #img_byte_arr = io.BytesIO()
-    #optimized_img.save(img_byte_arr, format='JPEG', quality=95, optimize=True)
-    # return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+    img_byte_arr = io.BytesIO()
+    optimized_img.save(img_byte_arr, format='JPEG', quality=95, optimize=True)
+    #return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # Assicura che la directory di destinazione esista
-    os.makedirs(DEBUG_DIR, exist_ok=True)
     # Genera un percorso univoco per il salvataggio
-    save_path = os.path.join(DEBUG_DIR, f"optimized_{int(time.time() * 1000)}.jpg")
+    save_path = os.path.join(DEBUG_DIR, f"optimized_{int(time.time() * 1000)}.png")
 
     # Salva l'immagine ottimizzata
-    optimized_img.save(save_path, format='JPEG', quality=95, optimize=True)
+    optimized_img.save(save_path, format='PNG', quality=95, optimize=True)
+    return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+    
 
-    return save_path
 
 # --- CONFIGURAZIONE OCR OLLAMA ---
-TABLE_OCR_OPTIONS = {"num_ctx": 4096,  "temperature": 0.0001, "num_predict": 4096}
+TABLE_OCR_OPTIONS = {"num_ctx": 8192, "temperature": 0.0, "num_predict": 4096, "repeat_penalty": 1.3}
 PAGE_OCR_OPTIONS = {"num_ctx": 16384, "num_predict": 4096, "temperature": 0.2, "repeat_penalty": 1.3}
 
 #Se una cella di una colonna è unita verticalmente e si applica a più punti elenco di un'altra colonna, devi sdoppiare la cella e RIPETERE il testo per ogni singola riga corrispondente.
@@ -267,7 +390,7 @@ Segui tassativamente queste linee guida ingegneristiche e universali:
 - Analizza la fine di ogni riga e l'inizio della successiva. Se una parola o una frase è chiaramente troncata a metà da un a capo, salda i due frammenti eliminando i trattini di sillabazione.
 
 3. PROPAGAZIONE DELLE CELLE UNITE VERTICALMENTE (SPANNING):
-- Se rilevi che una cella contiene dati strutturati importanti e le righe immediatamente successive presentano celle corrispondenti vuote (o contenenti solo spazi/simboli come '//'), propaga logicamente quel contesto. Puoi scegliere di duplicare il testo nelle righe successive oppure di consolidare tutte le sotto-infrazioni in un'unica macro-riga, separando i punti elenco interni esclusivamente con il tag HTML <br> per non rompere la riga della tabella Markdown.
+- Se rilevi che una cella contiene dati strutturati importanti e le righe immediatamente successive presentano celle corrispondenti vuote (o contenenti solo spazi/simboli come '//'), propaga logicamente quel contesto. Duplica il testo nelle righe successive.
 
 4. ELIMINAZIONE DEL RUMORE DI PAGINA (STRIPPING):
 - Riconosci e rimuovi completamente metadati ripetitivi che interrompono il flusso logico: numeri di pagina, intestazioni di pagina (header), piè di pagina (footer), indirizzi istituzionali, stringhe di protocollo e tag di annotazione delle immagini (es. ``).
@@ -275,12 +398,7 @@ Segui tassativamente queste linee guida ingegneristiche e universali:
 5. PRESERVAZIONE DEL TESTO NON TABELLARE:
 - Se il documento contiene paragrafi di testo normale, preservali esattamente nella loro posizione sequenziale originaria.
 
-6. TRASFORMAZIONE DI ELENCHI IN TABELLE CONTINUATIVE:
-- Se dopo una tabella incontri dei titoli seguiti da elenchi puntati o checkbox (□), comprendi che si tratta della continuazione logica della tabella precedente che il parser ha rotto.
-- Converti questi elenchi in righe della tabella precedente. 
-- Associa a ciascuna di queste nuove categorie i valori delle celle precedenti, senza lasciare celle vuote
-
-7. RIMOZIONE DELLE INTESTAZIONI:
+6. RIMOZIONE DELLE INTESTAZIONI:
 - All'inizio di ogni blocco di testo, se trovi un'intestazione che contiene il numero di telefono o il codice fiscale della scuola (82007870403), rimuovila completamente insieme a eventuali righe adiacenti che contengono informazioni di contatto o indirizzi.
 
 OUTPUT RICHIESTO:
@@ -296,7 +414,7 @@ Ecco il testo grezzo da elaborare:
                 "model": CORRECTION_MODEL,
                 "messages": [{"role": "user", "content": correction_prompt}],
                 "stream": False,
-                "options": {"num_ctx": 32768, "temperature": 0.1}
+                "options": {"num_ctx": 12288, "temperature": 0.1}
             },
             timeout=600
         )
@@ -332,63 +450,232 @@ def llm_normalize_markdown(md_text, separator_pattern, pages_per_chunk=3):
     requests.post("http://localhost:11434/api/generate", json={"model": CORRECTION_MODEL, "keep_alive": 0})
     return final_text
 
-TABLE_OCR_PROMPT = """Tu sei un OCR visivo di altissima precisione. Il tuo compito è convertire l'immagine di questa tabella complessa in formato Markdown pulito e strutturato.
+#Provare a cambiare testo prima colonna dicendo di allungare riga sotto
+#- PRIMA COLONNA: Assicurati di trascrivere TUTTO il testo nella colonna di sinistra, ma mantieni la struttura visiva originale.
+#- GESTIONE DELLE CELLE UNITE VERTICALMENTE: Se una macro-categoria si applica a un intero blocco di elementi, crea un'unica grande riga Markdown. Inserisci tutti gli elementi corrispondenti nella cella adiacente separati da <br>, in modo che rimangano perfettamente allineati visivamente con le rispettive colonne di riferimento.
+# 2. VIETATO TRASPORRE O RUOTARE LA TABELLA: Rispetta rigorosamente l'orientamento visivo originale. Le colonne dell'immagine DEVONO rimanere colonne nel Markdown (allineate in verticale tramite i caratteri |). Le righe dell'immagine DEVONO rimanere righe in orizzontale. È tassativamente vietato convertire i testi della colonna sinistra in intestazioni di colonna.
+TABLE_OCR_PROMPT = """Tu sei un OCR visivo avanzato. Il tuo compito è convertire l'immagine in formato Markdown pulito, accurato e strutturato.
 
-Segui queste istruzioni tassative:
+Segui queste istruzioni operative tassative:
 
-1. VIETATO RIASSUMERE O PARAFRASARE: Non ottimizzare il testo, non accorciare le frasi e non cambiare le parole (es. se c'è scritto 'collegamento internet per motivi personali, non di studio e ricerca', NON devi scrivere 'internet per motivi non scolastici'). Devi copiare ogni singola parola, inclusi gli articoli e le congiunzioni, carattere per carattere. Se accorci una frase, l'output è considerato ERRORE.
+1. TRASCRIZIONE INTEGRALE E LETTERALE
+- VIETATO RIASSUMERE, PARAFRASARE O ACCORCIARE: Copia ogni singola parola, articolo e congiunzione carattere per carattere. Qualsiasi omissione è un errore grave.
+- Mantieni la formattazione visiva (grassetto, sottolineato, MAIUSCOLO).
+- ATTENZIONE AI PORTATI A CAPO A FINE RIGA: Se una frase o un punto elenco è lungo e si sviluppa su più righe visive sovrapposte all'interno dello stesso blocco, non spezzare le parole e non invertire l'ordine dei frammenti di testo. Leggi la riga superiore fino alla fine, poi scendi alla riga inferiore partendo da sinistra e unisci il testo in modo logico e continuo.
 
-2. TRASCRIZIONE DEI TITOLI E DEL CONTESTO:
-Inizia trascrivendo fedelmente i titoli o i testi esplicativi presenti sopra la tabella usando la formattazione Markdown standard (## o ###).
+2. GESTIONE DEI CAMBI DI STRUTTURA E CELLE UNITE (Risoluzione dei blocchi)
+- L'immagine può presentare tabelle miste: sezioni divise in più colonne che poi confluiscono in righe a colonna singola.
+- Se una riga o una sezione della tabella occupa visivamente l'intera larghezza della pagina (cella unita / colspan), NON forzarla dentro la griglia a più colonne precedente. 
+- Gestisci le righe a colonna singola o i blocchi uniti in questo modo:
+  * Se contengono una sola parola o una dicitura di intestazione, chiudi la tabella precedente, digitala come un TITOLO in grassetto o testo normale centrato, e poi prosegui.
+  * Se contengono un elenco di punti o caselle di controllo sotto un'intestazione, trascrivili come testo normale fuori dalla tabella, usando l'elenco puntato standard Markdown o i quadratini.
+- GESTIONE DELLE CELLE MULTI-RIGA (ROW-SPAN): Se una colonna contiene un unico valore che si estende visivamente in verticale accanto a più righe della tabella, considera l'intero blocco come un'UNICA grande cella logica. Non spezzare il testo della colonna di destra in più righe Markdown separate; mantieni tutto associato allo stesso valore di sinistra nella stessa riga di tabella, usando il tag <br> per andare a capo all'interno delle celle se necessario.
 
-3. REGOLE DI STRUTTURA DELLA TABELLA (Uso del <br> per elenchi):
-- È tassativamente vietato l'uso di elenchi puntati all'interno della tabella, sia usando la sintassi Markdown (- o *), sia usando tag HTML (<ul>, <li>).
-- Se una cella contiene più punti elenco, frasi distinte o sotto-voci, trascrivili tutti all'interno della STESSA cella, separando ogni punto esclusivamente con il tag HTML <br> per andare a capo senza rompere la riga Markdown.
-- GESTIONE DELLE CELLE UNITE VERTICALMENTE: Se una macro-categoria si applica a un intero blocco di elementi, crea un'unica grande riga Markdown. Inserisci tutti gli elementi corrispondenti nella cella adiacente separati da <br>, in modo che rimangano perfettamente allineati visivamente con le rispettive colonne di riferimento.
+3. REGOLE PER LE ZONE A TABELLA STANDARD (A più colonne)
+- Nelle sezioni a più colonne, rispetta rigorosamente l'allineamento verticale tramite i caratteri |.
+- Se una cella di una tabella a più colonne contiene più righe, frasi o quadratini, inserisci tutto nella STESSA cella separando i vettori ESCLUSIVAMENTE con il tag HTML <br>.
+- NON generare righe interamente vuote nel codice Markdown.
 
-4. REGOLE DI RIGORE PER L'OUTPUT:
-- Inizia direttamente con il primo titolo o riga di testo rilevata in alto.
-- NON inserire introduzioni, saluti, commenti discorsivi o spiegazioni del tipo "Ecco la tabella convertita". Restituisci ESCLUSIVAMENTE l'output in Markdown.
-- Sii un OCR letterale: trascrivi ogni stringa esattamente come appare visivamente, senza riassumere, omettere o parafrasare il testo."""
+4. REGOLE DI OUTPUT
+- Restituisci ESCLUSIVAMENTE l'output in Markdown. No introduzioni, no commenti, no spiegazioni."""
 PAGE_OCR_PROMPT = """Trascrivine il contenuto in Markdown standard.
-Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella e uniscila ad essa.
+Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella.
 Se vedi parti di tabella che hanno una sola riga e colonna, trasformali in un elenco puntato.
 Se vedi parti di tabella con una sola colonna e una sola parola al suo interno, trasformalo in un titolo.
 Assicurati di scrivere tutto il testo nelle tabelle, se non riesci a dividere correttamente una riga di una tabella, trasformala in un paragrafo normale ma mantieni il testo.
 Mantieni titoli e strutture. Solo testo Markdown, no commenti."""
 
-def _call_ollama_ocr(image, prompt, options):
+def _call_ollama_ocr(image, prompt, options, model='qwen2.5vl:7b'):
     """Centralizza la chiamata a Ollama per ridurre la duplicazione e gestire la VRAM."""
+    print(f"Inizio chiamata OCR Ollama ({model})...")
     headers = {"Connection": "close"}
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": model,
+            "prompt": prompt,
+            "images": image if isinstance(image, list) else [image],
+            "options": options,
+            "stream": False
+        },
+        headers=headers, timeout=300
+    )
+    response.raise_for_status()
+    text = response.json().get("response", "").strip()
+    if not text:
+        raise Exception(f"Il modello {model} ha restituito un output vuoto.")
+
+    requests.post("http://localhost:11434/api/generate", json={"model": model, "keep_alive": 0})
+    return clean_junk_text(text)
+
+def check_ocr_basic_quality(text):
+    """Controlli euristici non-AI sulla qualità dell'OCR."""
+    if not text or len(text.strip()) < 15:
+        return False
+    # Ripetizioni di righe vuote (più di 4 consecutive) spesso segno di loop
+    if re.search(r'(\n\s*){5,}', text):
+        print("🔍 Qualità OCR: Fallito controllo righe vuote ripetute.")
+        return False
+    return True
+
+def check_ocr_ai_validation(text):
+    """Controllo tramite LLM per frasi senza senso o allucinazioni (usato quando non c'è Marker source)."""
+    validation_prompt = f"""Analizza il seguente testo estratto tramite OCR. 
+Il testo contiene allucinazioni gravi, frasi totalmente senza senso, sequenze di caratteri casuali o ripetizioni ossessive? 
+Rispondi esclusivamente con la parola 'sì' se il testo contiene questi errori (ed è quindi da scartare), oppure 'no' se il testo è leggibile e corretto.
+
+Testo da analizzare:
+---
+{text[:1500]}
+---
+Risposta (sì/no):"""
+
     try:
-        print("inizio chiamata OCR Ollama...")
-        
-        response = ollama.chat(
-            model='qwen2.5vl:3b',
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': [image],
-                'options': options
-            }]
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "qwen2.5:14b-instruct-q4_K_M", # Modello leggero e veloce per la validazione
+                "prompt": validation_prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 5}
+            },
+            timeout=60
         )
-        # response = requests.post(
-        #     "http://localhost:11434/api/chat",
-        #     json={
-        #         "model": "richardyoung/olmocr2:7b-q8",
-        #         "prompt": prompt,
-        #         "images": [image],
-        #         "stream": False,
-        #         "options": options
-        #     },
-        #     headers=headers, timeout=300
-        # )
-        #response.raise_for_status()
-        text = (response['message']['content']).strip()
-        requests.post("http://localhost:11434/api/generate", json={"model": "qwen2.5vl:3b", "keep_alive": 0})
-        return clean_junk_text(text)
+        val = response.json().get("response", "").strip().lower()
+        if "sì" in val or "si" in val:
+            print(f"🔍 Qualità OCR: LLM ha rilevato errori o no-sense (Risposta: {val}).")
+            return False
+        return True
     except Exception as e:
-        print(f"❌ Errore OCR Ollama: {e}")
+        print(f"⚠️ Errore validazione LLM: {e}. Procedo per prudenza.")
+        return True
+
+def refine_ocr_with_llm(vision_text, marker_text):
+    """Raffina l'output Vision OCR usando il testo integrale di Marker-PDF come riferimento."""
+    print(f"--- 🛠️ Raffinamento LLM ({CORRECTION_MODEL}) ---")
+    prompt = f"""Tu sei un assistente specializzato nella ricostruzione e correzione di documenti scolastici. Il tuo compito è generare un'unica tabella Markdown finale perfetta partendo da due fonti che hanno difetti diversi.
+
+Ecco le tue fonti:
+1. SORGENTE_VISION (Generata da un OCR visivo): Ha un'OTTIMA struttura geometrica di tabelle e colonne, ma contiene allucinazioni nei testi, parole frullate (es. "FRECOLASTICA") e lettere mancanti.
+2. SORGENTE_TEXT (Generata da Marker-PDF): Ha una STRUTTURA PESSIMA o disallineata, ma il testo e le parole interne sono al 100% integrali, corretti in italiano e privi di refusi di lettura.
+
+Istruzioni per la fusione:
+- Usa la SORGENTE_VISION come mappa per capire quante colonne e quante righe creare.
+- Usa la SORGENTE_TEXT per "riempire" le celle, sostituendo le parole allucinate o i refusi della sorgente vision con il testo pulito e integro di Marker-PDF.
+- Se nella SORGENTE_VISION un intero blocco di testo è stato ruotato o trasposto (es. trasformato in intestazione), raddrizzalo usando il senso logico delle frasi complete che trovi nella SORGENTE_TEXT.
+
+Restituisci esclusivamente la tabella Markdown finale corretta, senza commenti o introduzioni.
+
+---
+SORGENTE_VISION:
+{vision_text}
+
+---
+SORGENTE_TEXT:
+{marker_text}
+"""
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": CORRECTION_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_ctx": 12288}
+            },
+            timeout=300
+        )
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        print(f"⚠️ Errore raffinamento LLM: {e}")
+        return vision_text
+
+def run_ocr_pipeline(img_or_path, prompt, options, marker_text_page=None, page_idx=None):
+    """Pipeline di fallback: split + 3b -> split + 7b -> full + 7b con raffinamento LLM opzionale."""
+
+    def save_debug_md(content, suffix):
+        if page_idx is not None:
+            path = os.path.join(DEBUG_DIR, f"page_{page_idx+1}_{suffix}.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    if isinstance(img_or_path, str):
+        img = Image.open(img_or_path)
+    else:
+        img = img_or_path
+
+    # Tentativo 1: Immagine intera con modello 3b
+    try:
+        print("🚀 Tentativo 1: Immagine intera con modello 3b...")
+        img_str = encode_image(img)
+        res = _call_ollama_ocr(img_str, prompt, options, model="qwen2.5vl:3b")
+        if check_ocr_basic_quality(res):
+            save_debug_md(res, "raw")
+            if marker_text_page:
+                refined = refine_ocr_with_llm(res, marker_text_page)
+                save_debug_md(refined, "refined")
+                return refined
+            elif check_ocr_ai_validation(res):
+                return res
+    except Exception as e:
+        print(f"⚠️ Tentativo 1 (full+3b) fallito: {e}. Provo a valutare il taglio...")
+
+    # Calcolo del taglio (soglia abbassata per favorire la frammentazione se l'intera fallisce)
+    parts, was_split = pipeline_taglio_intelligente(img, altezza_soglia_critica=300)
+
+    if was_split:
+        # Tentativo 2: Immagine spezzata con modello 3b
+        try:
+            print("🚀 Tentativo 2: Immagine spezzata con modello 3b...")
+            ocr_results = []
+            for p in parts:
+                img_str = encode_image(p)
+                ocr_results.append(_call_ollama_ocr(img_str, prompt, options, model="qwen2.5vl:3b"))
+            combined_res = "\n\n".join(ocr_results).strip()
+            if check_ocr_basic_quality(combined_res):
+            save_debug_md(combined_res, "raw")
+                if marker_text_page:
+                refined = refine_ocr_with_llm(combined_res, marker_text_page)
+                save_debug_md(refined, "refined")
+                return refined
+                elif check_ocr_ai_validation(combined_res):
+                    return combined_res
+        except Exception as e:
+            print(f"⚠️ Tentativo 2 (split+3b) fallito: {e}. Provo split+7b...")
+
+        # Tentativo 3: Immagine spezzata con modello 7b
+        try:
+            print("🚀 Tentativo 3: Immagine spezzata con modello 7b...")
+            ocr_results = []
+            for p in parts:
+                img_str = encode_image(p)
+                ocr_results.append(_call_ollama_ocr(img_str, prompt, options, model="qwen2.5vl:7b"))
+            combined_res = "\n\n".join(ocr_results).strip()
+            if check_ocr_basic_quality(combined_res):
+            save_debug_md(combined_res, "raw")
+                if marker_text_page:
+                refined = refine_ocr_with_llm(combined_res, marker_text_page)
+                save_debug_md(refined, "refined")
+                return refined
+                elif check_ocr_ai_validation(combined_res):
+                    return combined_res
+        except Exception as e:
+            print(f"⚠️ Tentativo 3 (split+7b) fallito: {e}. Provo fallback finale full+7b...")
+
+    # Tentativo 4: Immagine intera con modello 7b (fallback finale)
+    try:
+        print("🚀 Tentativo 4 (Ultima spiaggia): Immagine intera con modello 7b...")
+        img_str = encode_image(img)
+        res = _call_ollama_ocr(img_str, prompt, options, model="qwen2.5vl:7b")
+        if check_ocr_basic_quality(res):
+            save_debug_md(res, "raw")
+            if marker_text_page:
+                refined = refine_ocr_with_llm(res, marker_text_page)
+                save_debug_md(refined, "refined")
+                return refined
+            return res
+    except Exception as e:
+        print(f"❌ Tentativo finale (full+7b) fallito: {e}")
         return ""
 
 def get_node_page_number(node):
@@ -422,8 +709,7 @@ def get_total_pages(file_path):
 # il pool di connessioni, invece di ricrearlo per ogni file salvato.
 db_engine = create_engine(str(settings.SQLALCHEMY_DATABASE_URI), future=True)
 
-
-def save_document_and_chunks_to_db(file_name, file_url, access_level, total_pages, chunks):
+def save_document_and_chunks_to_db(file_name, file_url, access_level, total_pages, chunks, file_hash=None, md_hash=None, created_at=None, expiry_date=None):
     if not access_level:
         raise ValueError("Access level mancante; rifiuto il caricamento del documento.")
 
@@ -431,14 +717,18 @@ def save_document_and_chunks_to_db(file_name, file_url, access_level, total_page
         with db_engine.begin() as conn:
             document_id = conn.execute(
                 text(
-                    "INSERT INTO documents (file_name, file_url, access_level, total_pages) "
-                    "VALUES (:file_name, :file_url, :access_level, :total_pages) RETURNING id"
+                    "INSERT INTO documents (file_name, upload_date, file_url, access_level, total_pages, file_hash, md_hash, expiry_date) "
+                    "VALUES (:file_name, :upload_date, :file_url, :access_level, :total_pages, :file_hash, :md_hash, :expiry_date) RETURNING id"
                 ),
                 {
                     "file_name": file_name,
+                    "upload_date": created_at,
                     "file_url": file_url,
                     "access_level": access_level,
                     "total_pages": total_pages,
+                    "file_hash": file_hash,
+                    "md_hash": md_hash,
+                    "expiry_date": expiry_date                
                 },
             ).scalar_one()
 
@@ -451,7 +741,7 @@ def save_document_and_chunks_to_db(file_name, file_url, access_level, total_page
                         "chunk_index": chunk["chunk_id"],
                         "page_number": chunk.get("page_number"),
                         "embedding": chunk.get("embedding"),
-                    }
+nelk                    }
                 )
 
             if chunk_rows:
@@ -594,7 +884,6 @@ def run_marker_pdf(pdf_path, output_dir):
             PATH_TO_MARK,
             pdf_path,
             "--output_dir", output_dir,
-            "--disable_ocr",
             "--paginate_output", # Disabilitiamo l'OCR interno di Marker per affidarlo completamente a GLM-OCR in caso di fallback
             "--debug"
         ], check=True)
@@ -651,9 +940,17 @@ def run_docling_pdf(pdf_path, output_dir):
         print(f"❌ Errore durante l'elaborazione con Docling: {e}")
         return None
 
-def glm_ocr(pdf_path, target_page_indices=None):
+def glm_ocr(pdf_path, target_page_indices=None, marker_text=None):
     print(f"--- 🚨 Avvio Vision-OCR (Qwen2.5-VL) ---")
     poppler_path = r"C:\Users\federico.mantoni\AppData\Local\miniconda3\envs\tesi2\Library\bin"
+
+    marker_pages = {}
+    if marker_text:
+        page_pattern = r'\{(\d+)\}-+'
+        parts = re.split(page_pattern, marker_text)
+        for i in range(1, len(parts), 2):
+            pid = int(parts[i])
+            marker_pages[pid] = parts[i+1].strip()
     
     target_indices_provided = target_page_indices is not None
     current_options = TABLE_OCR_OPTIONS if target_indices_provided else PAGE_OCR_OPTIONS
@@ -683,10 +980,9 @@ def glm_ocr(pdf_path, target_page_indices=None):
         debug_path = os.path.join(DEBUG_DIR, f"page_{i+1}.jpg")
         page.save(debug_path, "JPEG")
 
-        img_str = encode_image(page)
         prompt = TABLE_OCR_PROMPT if target_indices_provided else PAGE_OCR_PROMPT
 
-        testo_pagina = _call_ollama_ocr([img_str], prompt, current_options)
+        testo_pagina = run_ocr_pipeline(page, prompt, current_options, marker_text_page=marker_pages.get(i), page_idx=i)
         if testo_pagina:
             results_dict[i] = testo_pagina
             print(f"✅ Pagina {i+1} completata.")
@@ -705,26 +1001,7 @@ def glm_ocr(pdf_path, target_page_indices=None):
 def ocr_single_image(image_path):
     """Esegue l'OCR su un singolo file immagine e restituisce il testo Markdown."""
     print(f"🖼️ Esecuzione OCR su immagine: {image_path}")
-    img = Image.open(image_path)
-    img_str = encode_image(img)
-    # 1. Pipeline di taglio intelligente: decide se l'immagine va frammentata
-    image_parts = pipeline_taglio_intelligente(image_path)
-    
-    ocr_texts = []
-    for part_path in image_parts:
-        # 2. Codifica e chiamata OCR per ogni parte (singolarmente come richiesto)
-        img_str = encode_image(part_path)
-        text = _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
-        if text:
-            ocr_texts.append(text)
-        
-        # 3. Pulizia file temporanei se sono stati generati dal crop
-        if part_path != image_path:
-            try: os.remove(part_path)
-            except: pass
-            
-    return "\n\n".join(ocr_texts).strip()
-    #return _call_ollama_ocr(img_str, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
+    return run_ocr_pipeline(image_path, TABLE_OCR_PROMPT, TABLE_OCR_OPTIONS)
 
 def get_table_data(base_output_dir):
     """Analizza blocks.json di Marker per trovare pagine con tabelle."""
@@ -844,11 +1121,11 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
             f.write(content)
         return content
 
-    # Logica Ibrida: cerca tabelle e usa OCR mirato per quelle pagine
+    #Logica Ibrida: cerca tabelle e usa OCR mirato per quelle pagine
     table_pages, _ = get_table_data(base_output_dir)
     if table_pages:
         print(f"📊 Rilevate tabelle nelle pagine: {sorted(list(table_pages))}. Avvio OCR pagina per pagina...")
-        ocr_results = glm_ocr(pdf_path, target_page_indices=table_pages)
+        ocr_results = glm_ocr(pdf_path, target_page_indices=table_pages, marker_text=marker_text)
         marker_text = assemble_hybrid_markdown(marker_text, ocr_results)
         # Normalizzazione finale per il flusso Marker/Ibrido tramite LLM (3 pagine alla volta)
         final_text = llm_normalize_markdown(marker_text, r'\{\d+\}-+', pages_per_chunk=3)
@@ -862,25 +1139,62 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
     return marker_text
 
 
-def process_single_file(file_path, output_dir="output_dir", metadata=None): # Aggiunto metadata
+def process_single_file(file_path, output_dir="output_dir", metadata=None, debug_page=None): # Aggiunto metadata
     access_level = metadata.get("access_level") if metadata else None
     if not access_level:
         print(f"❌ Access level non trovato in {file_path}. Rifiuto il caricamento.")
         return []
 
     force_ocr = metadata.get("module_option") == "sì" # Estrai l'opzione per forzare l'OCR
+    expiry_date = metadata.get("expiry_date") # Estrai la data di scadenza opzionale
 
     print(f"Elaboro file: {file_path}")
     # Passa l'opzione force_ocr a get_md_content
-    content = get_md_content(file_path, output_dir, force_ocr=force_ocr)
+    content = get_md_content(file_path, output_dir, force_ocr=force_ocr, debug_page=debug_page)
     if not content:
         print(f"❌ Contenuto non disponibile per {file_path}. Salto.")
         return []
 
-
     total_pages = get_total_pages(file_path)
     file_url = os.path.abspath(file_path)
     file_name = os.path.basename(file_path)
+    
+    created_at = datetime.now().isoformat()
+    # --- CALCOLO METADATI E SALVATAGGIO FILE .META ---
+    with open(file_path, "rb") as f:
+        file_hash = hashlib.sha256(f.read()).hexdigest()
+    md_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    
+    # Determina la cartella di output (coerente con get_md_content)
+    base_name = os.path.splitext(file_name)[0]
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        meta_save_dir = os.path.join(os.path.abspath(output_dir), base_name)
+    else:
+        meta_save_dir = os.path.abspath(output_dir)
+    
+    os.makedirs(meta_save_dir, exist_ok=True)
+    meta_file_path = os.path.join(meta_save_dir, f"{file_name}.meta")
+    
+    meta_data = {
+        "file_name": file_name,
+        "file_url": file_url,
+        "total_pages": total_pages,
+        "file_hash": file_hash,
+        "md_hash": md_hash,
+        "ocr_used": force_ocr, # Nota: per precisione estrema andrebbe tracciato se l'ibrido ha attivato l'OCR
+        "marker_version": "1.10.2",
+        "created_at": created_at,
+        "expiry_date": expiry_date
+    }
+    
+    try:
+        with open(meta_file_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=4, ensure_ascii=False)
+        print(f"📝 Metadata salvati in: {meta_file_path}")
+    except Exception as e:
+        print(f"⚠️ Errore salvataggio metadata: {e}")
+    # ------------------------------------------------
 
     metadata.update({"source_path": file_path})
 
@@ -890,13 +1204,27 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None): # Ag
     )
 
     if file_chunks:
-        save_document_and_chunks_to_db(file_name, file_url, access_level, total_pages, file_chunks)
+        save_document_and_chunks_to_db(
+            file_name, file_url, access_level, total_pages, file_chunks,
+            file_hash=file_hash, md_hash=md_hash,
+            created_at=created_at, expiry_date=expiry_date
+        )
     return file_chunks
 
 
-def get_md_content(file_path, output_dir="output_dir", force_ocr=False): # Aggiunto force_ocr
+def get_md_content(file_path, output_dir="output_dir", force_ocr=False, debug_page=None): # Aggiunto force_ocr
     ext = os.path.splitext(file_path)[1].lower()
+
     if ext == ".pdf":
+        if debug_page is not None:
+            # Se debug_page è presente nei metadati, eseguiamo l'OCR solo su quella pagina
+            print(f"🔍 DEBUG: Esecuzione OCR mirata sulla pagina {debug_page}...")
+            page_idx = int(debug_page) - 1
+            ocr_results = glm_ocr(file_path, target_page_indices=[page_idx])
+            with open(fr"output_dir/pag.{debug_page}.md", "w", encoding="utf-8") as f:
+                f.write(ocr_results.get(page_idx, ""))
+            return ocr_results.get(page_idx, "")
+
         # Passa force_ocr alla funzione di elaborazione PDF
         return run_marker_pdf_with_fallback(file_path, output_dir, force_ocr=force_ocr)
     elif ext == ".docx":
@@ -948,7 +1276,7 @@ def save_semantic_chunks(chunks, output_path):
         json.dump(chunks, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
-    input_path = r"ocr_debug_images\page_7.jpg"  # Sostituisci con il percorso reale del tuo file o cartella
+    input_path = r"files/Regolamento-disciplinare.pdf" 
     output_dir = "output_dir"
     metadata = {"access_level": "public", "module_option": "no"}  # Sostituisci con la logica reale per estrarre l'access level
     ensure_output_dir(output_dir)
@@ -956,7 +1284,9 @@ if __name__ == "__main__":
     if os.path.isdir(input_path):
         chunks = process_folder(input_path, output_dir, metadata)
     elif os.path.isfile(input_path):
-        chunks = process_single_file(input_path, output_dir, metadata)
+        #pag.7 avrebbe bisogno di split
+        #pag.8 non ma con 7b
+        chunks = process_single_file(input_path, output_dir, metadata, debug_page=14)  # Aggiunto debug_page per testare una pagina specifica
     else:
         raise FileNotFoundError(f"Il percorso specificato non esiste: {input_path}")
 

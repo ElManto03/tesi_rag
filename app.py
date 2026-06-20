@@ -3,23 +3,11 @@ from contextlib import asynccontextmanager
 import os
 import shutil
 import tempfile
-
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse
-from sqlmodel import Session, create_engine
-
-from config import settings
-from ocr_to_md import process_single_file # Importa la funzione di elaborazione file
-
-
-engine = create_engine(str(settings.SQLALCHEMY_DATABASE_URI))
-
-
-def create_db_and_tables() -> None:
-    # Nota: Assicurati che le tabelle 'documents' e 'document_chunks' siano create 
-    # o tramite SQLModel qui o tramite migrazioni/script SQL esterni.
-    pass
-
+from db_manager import create_db_and_tables # Importa la funzione di creazione tabelle
+from file_processor import process_single_file # Importa la funzione di elaborazione file
+from chatbot import get_query_embedding, retrieve_context, generate_answer, is_query_safe, ask_question
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -40,10 +28,17 @@ async def main_interface():
     <html>
     <head>
         <title>RAG Test App</title>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; background-color: #f0f2f5; }
             nav { background: #001529; color: white; padding: 1rem; display: flex; gap: 20px; }
             nav a { color: #a6adb4; text-decoration: none; cursor: pointer; font-weight: 500; }
+            .role-selector { margin-left: auto; align-self: center; font-size: 0.9rem; }
+            .role-selector select { padding: 4px; border-radius: 4px; border: none; background: #002140; color: white; }
+            .level-selector { align-self: center; font-size: 0.9rem; margin-left: 10px; color: white; }
+            .level-selector select { padding: 4px; border-radius: 4px; border: none; background: #002140; color: white; }
+            .language-selector { align-self: center; font-size: 0.9rem; margin-left: 10px; color: white; }
+            .language-selector select { padding: 4px; border-radius: 4px; border: none; background: #002140; color: white; }
             nav a.active { color: white; border-bottom: 2px solid #1890ff; }
             .container { padding: 20px; flex-grow: 1; }
             .section { display: none; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -52,6 +47,14 @@ async def main_interface():
             input[type="text"], select { padding: 8px; border: 1px solid #d9d9d9; border-radius: 4px; }
             button { padding: 8px 16px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px 0; }
             button:hover { background: #40a9ff; }
+            .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+            .message p { margin: 5px 0; }
+            .message ul, .message ol { padding-left: 25px; margin: 5px 0; }
+            .message h1, .message h2, .message h3 { font-size: 1.2rem; margin: 10px 0 5px 0; }
+            .message code { background: #eee; padding: 2px 4px; border-radius: 3px; font-family: monospace; }
+            .user-msg { background: #e6f7ff; border-left: 4px solid #1890ff; }
+            .bot-msg { background: #f6ffed; border-left: 4px solid #52c41a; }
+            .sources { font-size: 0.8rem; color: #888; margin-top: 5px; }
             table { width: 100%; border-collapse: collapse; margin-top: 20px; }
             th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
             th { background-color: #f8f9fa; }
@@ -77,6 +80,30 @@ async def main_interface():
         <nav>
             <a id="nav-chat" onclick="showSection('chat')" class="active">Chatbot</a>
             <a id="nav-upload" onclick="showSection('upload')">Upload Documenti</a>
+            <div class="role-selector">
+                Ruolo: 
+                <select id="sim-role" onchange="updateRole()">
+                    <option value="developer">Developer (Admin)</option>
+                    <option value="user">User (Sola Lettura)</option>
+                </select>
+            </div>
+            <div class="level-selector">
+                Livello: 
+                <select id="sim-level" onchange="updateRole()">
+                    <option value="public">Pubblico</option>
+                    <option value="private">Privato</option>
+                </select>
+            </div>
+            <div class="language-selector">
+                Lingua: 
+                <select id="sim-lang" onchange="updateRole()">
+                    <option value="italiano">Italiano</option>
+                    <option value="inglese">Inglese</option>
+                    <option value="francese">Francese</option>
+                    <option value="tedesco">Tedesco</option>
+                    <option value="spagnolo">Spagnolo</option>
+                </select>
+            </div>
         </nav>
 
         <div class="container">
@@ -91,13 +118,13 @@ async def main_interface():
             <!-- Sezione Upload -->
             <div id="section-upload" class="section">
                 <h2>Carica Nuovo Documento</h2>
-                <p>Seleziona file o una cartella per caricarli massivamente. Sono accettati solo file .docx e .pdf (consigliato).</p>
+                <p>Seleziona file o una cartella per caricarli massivamente. Sono accettati solo file .docx, .html e .pdf (consigliato).</p>
                 <label for="fileInput"><b>Carica cartella:</b></label>
                 <input type="file" id="fileInput" multiple webkitdirectory mozdirectory>
                 <p><b>O carica file singoli qui sotto:</b></p>
 
-                <input type="file" id="hiddenFileInput" accept=".pdf,.docx" multiple style="display: none;">
-                <div id="drop-zone">Trascina qui i tuoi file .pdf o .docx (o clicca per selezionarli)</div>
+                <input type="file" id="hiddenFileInput" accept=".pdf,.docx,.html" multiple style="display: none;">
+                <div id="drop-zone">Trascina qui i tuoi file .pdf, .docx o .html (o clicca per selezionarli)</div>
 
                 <div id="upload-controls" style="display:none; margin-top: 20px;">
                     <button onclick="processAll()">Avvia Elaborazione Massiva</button>
@@ -107,6 +134,7 @@ async def main_interface():
                                 <th>Nome File</th>
                                 <th>Access Level</th>
                                 <th>OCR Forzato (consigliato per moduli)</th>
+                                <th>Scadenza (Opzionale)</th>
                                 <th>Stato</th>
                                 <th>Azioni</th>
                             </tr>
@@ -118,7 +146,30 @@ async def main_interface():
         </div>
 
         <script>
+            function updateRole() {
+                const role = document.getElementById('sim-role').value;
+                const level = document.getElementById('sim-level').value;
+                const lang = document.getElementById('sim-lang').value;
+                localStorage.setItem('simRole', role);
+                localStorage.setItem('simLevel', level);
+                localStorage.setItem('simLang', lang);
+                // Se cambiamo in user mentre siamo in upload, torniamo alla chat
+                const currentSection = localStorage.getItem('activeSection') || 'chat';
+                showSection(role === 'user' ? 'chat' : currentSection);
+            }
+
             function showSection(id) {
+                const role = localStorage.getItem('simRole') || 'developer';
+                const level = localStorage.getItem('simLevel') || 'public';
+                const lang = localStorage.getItem('simLang') || 'italiano';
+                document.getElementById('sim-role').value = role;
+                document.getElementById('sim-level').value = level;
+                document.getElementById('sim-lang').value = lang;
+
+                // UI Restriction: L'utente vede solo il chatbot
+                document.getElementById('nav-upload').style.display = (role === 'user') ? 'none' : 'inline';
+                if (role === 'user' && id === 'upload') id = 'chat';
+
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
                 document.getElementById('section-' + id).classList.add('active');
@@ -128,8 +179,7 @@ async def main_interface():
 
             // Al caricamento della pagina, ripristina l'ultima sezione visitata
             document.addEventListener('DOMContentLoaded', () => {
-                const activeSection = localStorage.getItem('activeSection') || 'chat';
-                showSection(activeSection);
+                updateRole();
             });
 
             let selectedFiles = [];
@@ -139,11 +189,11 @@ async def main_interface():
 
             function handleFiles(fileList) {
                 const files = Array.from(fileList).filter(f =>
-                    f.name.endsWith('.pdf') || f.name.endsWith('.docx')
+                    f.name.endsWith('.pdf') || f.name.endsWith('.docx') || f.name.endsWith('.html')
                 );
                 
                 if (files.length === 0) {
-                    alert("Nessun file .pdf o .docx valido trovato nella selezione. Si prega di selezionare file supportati.");
+                    alert("Nessun file .pdf, .docx o .html valido trovato nella selezione. Si prega di selezionare file supportati.");
                     document.getElementById('upload-controls').style.display = 'none';
                     return;
                 }
@@ -192,6 +242,9 @@ async def main_interface():
                                 <option value="sì">Sì</option>
                             </select>
                         </td>
+                        <td>
+                            <input type="date" id="expiry-${index}">
+                        </td>
                         <td id="status-${index}" class="status-waiting">In attesa...</td>
                         <td>
                             <button onclick="removeFile(${index})" style="background-color: #ff4d4f; padding: 5px 10px;">Rimuovi</button>
@@ -217,10 +270,13 @@ async def main_interface():
                     statusCell.innerText = "In elaborazione...";
                     statusCell.className = "status-working";
 
+                    const role = localStorage.getItem('simRole') || 'developer';
                     const formData = new FormData();
                     formData.append('file', selectedFiles[i]);
                     formData.append('access_level', document.getElementById(`access-${i}`).value);
                     formData.append('module_option', document.getElementById(`ocr-${i}`).value);
+                    formData.append('expiry_date', document.getElementById(`expiry-${i}`).value);
+                    formData.append('db_role', role);
 
                     try {
                         const response = await fetch('/uploadfile/', { method: 'POST', body: formData });
@@ -240,21 +296,90 @@ async def main_interface():
                 }
             }
 
-            function sendMessage() {
-                alert("Funzionalità chatbot non ancora collegata all'endpoint di ricerca!");
+            async function sendMessage() {
+                const input = document.getElementById('chat-input');
+                const text = input.value.trim();
+                if (!text) return;
+
+                const chatOutput = document.getElementById('chat-output');
+                const role = localStorage.getItem('simRole') || 'developer';
+                const level = localStorage.getItem('simLevel') || 'public';
+                const lang = localStorage.getItem('simLang') || 'italiano';
+                
+                // Aggiungi messaggio utente
+                chatOutput.innerHTML += `<div class="message user-msg"><b>Tu:</b> ${text}</div>`;
+                input.value = '';
+                chatOutput.scrollTop = chatOutput.scrollHeight;
+
+                try {
+                    const response = await fetch('/chat/', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ question: text, role: role, level: level, language: lang })
+                    });
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        let sourceHtml = data.sources.length ? `<div class="sources">Fonti: ${data.sources.join(', ')}</div>` : '';
+                        const interpretedHtml = marked.parse(data.answer);
+                        chatOutput.innerHTML += `<div class="message bot-msg"><b>Bot:</b> ${interpretedHtml}${sourceHtml}</div>`;
+                    } else {
+                        // Gestione del blocco sicurezza o errore (HTTP 400 / 500)
+                        let errorMsg = "Si è verificato un errore.";
+            
+                        if (data.detail) {
+                        // Se abbiamo personalizzato l'errore con un dizionario {"message": "..."}
+                            errorMsg = data.detail.message || data.detail;
+                        }
+                        chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore:</b> ${data.detail}</div>`;
+                    }
+                } catch (e) {
+                    chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore:</b> Impossibile contattare il server.</div>`;
+                }
+                chatOutput.scrollTop = chatOutput.scrollHeight;
             }
         </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
+@app.post("/chat/")
+async def chat_endpoint(payload: dict):
+    question = payload.get("question")
+    role = payload.get("role", "user")
+    level = payload.get("level", "public")
+    language = payload.get("language", "italiano")
+    
+    if not question:
+        raise HTTPException(status_code=400, detail="Domanda mancante")
 
+    try:
+        # Chiamiamo la pipeline completa e centralizzata che abbiamo protetto prima
+        result = await ask_question(
+            query=question, 
+            db_role=role, 
+            user_level=level, 
+            language=language
+        )
+        return result
+
+    except HTTPException as http_err:
+        # Se ask_question lancia una HTTPException (es. blocco sicurezza), la rilanciamo al client
+        raise http_err
+    except Exception as e:
+        # Errore generico di sistema
+        print(f"[-] Errore imprevisto nel backend: {str(e)}")
+        raise HTTPException(status_code=500, detail="Errore interno del server durante l'elaborazione.")
 
 @app.post("/uploadfile/")
-async def upload_file(file: UploadFile = File(...), access_level: str = Form(...), module_option: str = Form(...)):
+async def upload_file(file: UploadFile = File(...), access_level: str = Form(...), module_option: str = Form(...), expiry_date: str = Form(None), db_role: str = Form("user")):
     """
     Endpoint per caricare un file, processarlo e salvare gli embedding nel DB.
     """
+    # Protezione lato Server: Blocca l'azione se il ruolo simulato non è developer
+    if db_role != "developer":
+        raise HTTPException(status_code=403, detail="Azione di caricamento non consentita per il ruolo Utente.")
+
     if not file.filename:
         return {"message": "Nessun file selezionato"}
 
@@ -269,11 +394,12 @@ async def upload_file(file: UploadFile = File(...), access_level: str = Form(...
             # Prepara i metadati richiesti da process_single_file
             metadata = {
                 "access_level": access_level,
-                "module_option": module_option
+                "module_option": module_option,
+                "expiry_date": expiry_date
             }
 
             # Processa il file usando la logica di ocr_to_md.py
-            chunks = process_single_file(file_location, output_dir="output_dir", metadata=metadata)
+            chunks = process_single_file(file_location, output_dir="output_dir", metadata=metadata, db_role=db_role)
 
             if chunks:
                 return {"message": f"File '{file.filename}' caricato e processato con successo. Generati {len(chunks)} chunk."}

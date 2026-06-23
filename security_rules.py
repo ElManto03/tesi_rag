@@ -39,6 +39,21 @@ BLOCKLIST_PROMPT_INJECTION = [
     r"cosa ne pensi di",
     r"Cosa pensi di",
     r"cosa pensi di"
+
+    #6 6. Pattern dati sensibili
+
+    # Codice Fiscale Italiano (Incentrato sul pattern standard a 16 caratteri)
+    r"[A-Z]{6}[0-9LMNPQRSTUV]{2}[A-EHLMPR-T][0-9LMNPQRSTUV]{2}[A-Z][0-9LMNPQRSTUV]{3}[A-Z]",
+    
+    # Carte di Credito (Visa, Mastercard, Amex - stringhe di 13-16 cifre con possibili separatori)
+    r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b",
+    
+    # IBAN Italiano (IT + 2 cifre di controllo + 1 carattere nazionale + 22 caratteri alfanumerici)
+    r"\bIT[0-9]{2}[A-Z][0-9]{10}[A-Z0-9]{12}\b",
+    
+    # Indirizzi IPv4 (Utili per evitare scansioni di rete tramite prompt)
+    r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
+
 ]
 
 BANNED_SCHOOL_TOPICS = [
@@ -70,9 +85,55 @@ BANNED_SCHOOL_TOPICS = [
     "consigli di investimento finanziario"
 ]
 
+BLOCKLIST_OUTPUT_TOPICS = [
+    # 1. Sicurezza e Hacking (Bypass e generazione di exploit o codice maligno)
+    "attacchi informatici", 
+    "hacking e pirateria informatica", 
+    "exploit e vulnerabilità",
+    "codice sorgente dell'applicazione",
+    "credenziali e configurazioni server",
+    "configurazioni di sistema e database",
+    
+    # 2. Generazione di Codice e Scripting non autorizzato
+    # (Se il RAG deve solo dare risposte testuali, la generazione di codice è un'anomalia)
+    "generazione di codice sorgente",
+    "programmazione e sviluppo software",
+
+    # 3. Contenuti inappropriati in ambiente scolastico/aziendale
+    "violenza e armi",
+    "droghe e sostanze illegali",
+    "contenuti per adulti e pornografia",
+    "volgarità",
+    
+    # 4. Politica, ideologia e discriminazione (Neutralità dell'output)
+    "politica ed elezioni",
+    "dibattiti religiosi",
+    "discorso d'odio e discriminazione",
+    "opinioni politiche personali",
+
+    # 5. Consulenze ad alto rischio e responsabilità civile (GDPR / Allucinazioni)
+    # (Evita che il modello fornisca pareri medici o legali inventati basandosi sui documenti)
+    "consigli medici e diagnosi",
+    "consulenza legale professionale",
+    "consigli di investimento finanziario"
+]
+
+WHITELIST_DEFAULT_SENTENCES = [
+    r"Mi dispiace, ma non ho trovato questa specifica informazione nei regolamenti o nelle circolari ufficiali della scuola.",
+    r"Assistente Virtuale Ufficiale dell'ITTS \"O.Belluzzi L.da Vinci\"",
+    r"Official Virtual Assistant of ITTS \"O.Belluzzi L.da Vinci\"",
+    r"I'm sorry, but I don't have the (ability|capability) to provide guidance on that topic"
+]
+
 def is_query_safe(query: str) -> bool:
     """Verifica se il testo contiene pattern di prompt injection."""
     for pattern in BLOCKLIST_PROMPT_INJECTION:
         if re.search(pattern, query, re.IGNORECASE):
             return False
     return True
+
+def is_default_response(response: str) -> bool:
+    for pattern in WHITELIST_DEFAULT_SENTENCES:
+        if re.search(pattern, response, re.IGNORECASE):
+            return True
+    return False

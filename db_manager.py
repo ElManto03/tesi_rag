@@ -1,4 +1,5 @@
 import os
+import json
 from abc import ABC, abstractmethod
 import psycopg
 from sqlalchemy import create_engine, text
@@ -100,3 +101,52 @@ def save_document_and_chunks_to_db(file_name, file_url, access_level, total_page
     if adapter is None:
         adapter = PostgresStoreAdapter(db_engine)
     return adapter.save_document(file_name, file_url, access_level, total_pages, chunks, db_role=db_role, **kwargs)
+
+def salva_audit_log_bg(user_role: str, security_blocked: bool, log_data_dict: dict):
+    """
+    Salva il report dell'audit trail su database forzando il ruolo developer 
+    per superare i vincoli di sicurezza RLS.
+    """
+    query = text("""
+        INSERT INTO audit_logs (user_role, security_blocked, log_data)
+        VALUES (:user_role, :security_blocked, :log_data);
+    """)
+    
+    try:
+        with db_engine.connect() as conn:
+            # Forziamo il ruolo developer per la sessione corrente di scrittura log
+            #conn.execute(text("SET app.current_role = 'developer';"))
+            conn.execute(text("SELECT set_config('app.current_role', 'developer', false);"))
+            
+            conn.execute(query, {
+                "user_role": user_role,
+                "security_blocked": security_blocked,
+                "log_data": json.dumps(log_data_dict)
+            })
+            conn.commit()
+            print("[AUDIT DB] Log di audit salvato con successo.")
+    except Exception as e:
+        print(f"[AUDIT DB] ERRORE CRITICO durante il salvataggio del log: {e}")
+
+def salva_ingestion_log(user_role: str, file_name: str, file_hash: str, ingestion_data_dict: dict):
+    """
+    Salva i metadati di ingestion sul database forzando il ruolo developer.
+    """
+    query = text("""
+        INSERT INTO ingestion_logs (user_role, file_name, file_hash_sha256, ingestion_data)
+        VALUES (:user_role, :file_name, :file_hash, :ingestion_data);
+    """)
+    try:
+        with db_engine.connect() as conn:
+            #conn.execute(text("SET app.current_role = 'developer';"))
+            conn.execute(text("SELECT set_config('app.current_role', 'developer', false);"))
+            conn.execute(query, {
+                "user_role": user_role,
+                "file_name": file_name,
+                "file_hash": file_hash,
+                "ingestion_data": json.dumps(ingestion_data_dict)
+            })
+            conn.commit()
+            print(f"[INGESTION DB] Log salvato con successo per il file: {file_name}")
+    except Exception as e:
+        print(f"[INGESTION DB] ERRORE durante il salvataggio del log di ingestion: {e}")

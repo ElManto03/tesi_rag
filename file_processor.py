@@ -2,6 +2,7 @@ import os
 import hashlib
 import json
 from datetime import datetime
+from db_manager import salva_ingestion_log
 
 # Import conversion logic from document_converter.py
 from document_converter import (
@@ -86,6 +87,37 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None, debug
             created_at=created_at, expiry_date=expiry_date,
             db_role=db_role
         )
+
+    # 2. COMPOSIZIONE LOG DI INGESTION PER AUDIT TRAIL
+        # Qui isoliamo la logica di tracciamento per l'analisi di sicurezza
+        ingestion_data = {
+            "file_size_bytes": os.path.getsize(file_path),
+            "total_pages": total_pages,
+            "md_hash_sha256": md_hash,
+            "pipeline_info": {
+                "ocr_triggered": force_ocr,
+                # Puoi rendere questa stringa dinamica in base a quale funzione ha risposto su document_converter
+                "ocr_engine_used": "MarkerPdf hybrid with qwen2.5vl OCR",
+                "converter_version": "1.10.2",
+                # Lascio questi campi pronti per quando vorrai compilarli con i tuoi dati reali
+                "text_splitter": {
+                    "type": "Markdown-Aware Semantic Chunking",
+                    "parameters": "Aggiungi i tuoi parametri qui"
+                },
+                "embedding_model": "qwen3-embedding:8b"
+            },
+            "total_chunks_created": len(file_chunks),
+            "status": "SUCCESS"
+        }
+        
+        # Inviamo i dati alla nuova tabella di log
+        salva_ingestion_log(
+            user_role=db_role,
+            file_name=file_name,
+            file_hash=file_hash,
+            ingestion_data_dict=ingestion_data
+        )
+
     return file_chunks
 
 def process_folder(folder_path, output_dir="output_dir", metadata=None, db_role='user'):

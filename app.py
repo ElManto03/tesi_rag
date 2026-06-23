@@ -1,13 +1,19 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import os
+import logging
 import shutil
 import tempfile
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from authlib.integrations.starlette_client import OAuth
 from db_manager import create_db_and_tables # Importa la funzione di creazione tabelle
 from file_processor import process_single_file # Importa la funzione di elaborazione file
 from chatbot import get_query_embedding, retrieve_context, generate_answer, is_query_safe, ask_question
+from file_server import router as file_router
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -16,7 +22,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
-
+app.include_router(file_router)
+oauth = OAuth()
 
 @app.get("/", response_class=HTMLResponse)
 async def main_interface():
@@ -47,6 +54,9 @@ async def main_interface():
             input[type="text"], select { padding: 8px; border: 1px solid #d9d9d9; border-radius: 4px; }
             button { padding: 8px 16px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px 0; }
             button:hover { background: #40a9ff; }
+            button#stop-btn:hover { background: #ff7875; }
+            button#stop-btn { display: none; }
+            button#stop-btn.visible { display: inline-block; }
             .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
             .message p { margin: 5px 0; }
             .message ul, .message ol { padding-left: 25px; margin: 5px 0; }
@@ -81,21 +91,21 @@ async def main_interface():
             <a id="nav-chat" onclick="showSection('chat')" class="active">Chatbot</a>
             <a id="nav-upload" onclick="showSection('upload')">Upload Documenti</a>
             <div class="role-selector">
-                Ruolo: 
+                Ruolo:
                 <select id="sim-role" onchange="updateRole()">
                     <option value="developer">Developer (Admin)</option>
                     <option value="user">User (Sola Lettura)</option>
                 </select>
             </div>
             <div class="level-selector">
-                Livello: 
+                Livello:
                 <select id="sim-level" onchange="updateRole()">
                     <option value="public">Pubblico</option>
                     <option value="private">Privato</option>
                 </select>
             </div>
             <div class="language-selector">
-                Lingua: 
+                Lingua:
                 <select id="sim-lang" onchange="updateRole()">
                     <option value="italiano">Italiano</option>
                     <option value="inglese">Inglese</option>
@@ -111,8 +121,10 @@ async def main_interface():
             <div id="section-chat" class="section active">
                 <h2>Interroga il Chatbot</h2>
                 <div class="chat-box" id="chat-output">Benvenuto! Carica un documento o fammi una domanda...</div>
-                <input type="text" id="chat-input" style="width: 70%;" placeholder="Scrivi qui la tua domanda...">
-                <button onclick="sendMessage()">Invia</button>
+                <input type="text" id="chat-input" style="width: 55%;" placeholder="Scrivi qui la tua domanda...">
+                <button id="send-btn" onclick="sendMessage()">Invia</button>
+                <button id="stop-btn" onclick="stopMessage()" style="background-color: #ff4d4f;">Ferma</button>
+                <button id="block-btn" onclick="blockPrompt()" style="background-color: #fa8c16;">Blocca</button>
             </div>
 
             <!-- Sezione Upload -->
@@ -146,6 +158,21 @@ async def main_interface():
         </div>
 
         <script>
+            let currentAbortController = null;
+
+            marked.use({
+                renderer: {
+                    link(token) {
+                        // Estraiamo le proprietà dall'oggetto token
+                        const href = token.href || '';
+                        const title = token.title ? `title="${token.title}"` : '';
+                        const text = token.text || href;
+                        
+                        return `<a href="${href}" ${title} target="_blank" rel="noopener noreferrer">${text}</a>`;
+                    }
+                }
+            });
+            
             function updateRole() {
                 const role = document.getElementById('sim-role').value;
                 const level = document.getElementById('sim-level').value;
@@ -191,7 +218,7 @@ async def main_interface():
                 const files = Array.from(fileList).filter(f =>
                     f.name.endsWith('.pdf') || f.name.endsWith('.docx') || f.name.endsWith('.html')
                 );
-                
+
                 if (files.length === 0) {
                     alert("Nessun file .pdf, .docx o .html valido trovato nella selezione. Si prega di selezionare file supportati.");
                     document.getElementById('upload-controls').style.display = 'none';
@@ -208,7 +235,7 @@ async def main_interface():
             // Drag and Drop Logic
             const dropZone = document.getElementById('drop-zone');
             const hiddenFileInput = document.getElementById('hiddenFileInput'); // Nuovo input nascosto
-            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(name => { 
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(name => {
                 dropZone.addEventListener(name, (e) => { e.preventDefault(); e.stopPropagation(); });
             });
             dropZone.addEventListener('dragover', () => dropZone.classList.add('dragover'));
@@ -281,7 +308,7 @@ async def main_interface():
                     try {
                         const response = await fetch('/uploadfile/', { method: 'POST', body: formData });
                         const result = await response.json();
-                        
+
                         if (response.ok) {
                             statusCell.innerText = "Completato";
                             statusCell.className = "status-done";
@@ -296,6 +323,15 @@ async def main_interface():
                 }
             }
 
+            function blockPrompt() {
+                if (currentAbortController) {
+                    currentAbortController.abort();
+                    console.log("[DEBUG RAG] Pulsante Stop cliccato. Richiesta annullata.");
+                } else {
+                    console.log("[DEBUG RAG] Nessuna generazione attiva da interrompere.");
+                }
+            }
+
             async function sendMessage() {
                 const input = document.getElementById('chat-input');
                 const text = input.value.trim();
@@ -305,36 +341,90 @@ async def main_interface():
                 const role = localStorage.getItem('simRole') || 'developer';
                 const level = localStorage.getItem('simLevel') || 'public';
                 const lang = localStorage.getItem('simLang') || 'italiano';
-                
+
                 // Aggiungi messaggio utente
                 chatOutput.innerHTML += `<div class="message user-msg"><b>Tu:</b> ${text}</div>`;
                 input.value = '';
                 chatOutput.scrollTop = chatOutput.scrollHeight;
 
+                // ─── NUOVA LOGICA ABORT CONTROLLER ───
+                // Se c'era una generazione precedente ancora attiva, la interrompiamo per sicurezza
+                if (currentAbortController) {
+                    currentAbortController.abort();
+                }
+                // Creiamo un nuovo controller per questa specifica richiesta
+                currentAbortController = new AbortController();
+                const signal = currentAbortController.signal;
+                // ─────────────────────────────────────
+
                 try {
                     const response = await fetch('/chat/', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question: text, role: role, level: level, language: lang })
+                        body: JSON.stringify({ question: text, role: role, level: level, language: lang }),
+                        signal: signal
                     });
-                    const data = await response.json();
-                    
-                    if (response.ok) {
-                        let sourceHtml = data.sources.length ? `<div class="sources">Fonti: ${data.sources.join(', ')}</div>` : '';
-                        const interpretedHtml = marked.parse(data.answer);
-                        chatOutput.innerHTML += `<div class="message bot-msg"><b>Bot:</b> ${interpretedHtml}${sourceHtml}</div>`;
-                    } else {
-                        // Gestione del blocco sicurezza o errore (HTTP 400 / 500)
+
+                    if (!response.ok) {
+                        const data = await response.json();
                         let errorMsg = "Si è verificato un errore.";
-            
-                        if (data.detail) {
-                        // Se abbiamo personalizzato l'errore con un dizionario {"message": "..."}
-                            errorMsg = data.detail.message || data.detail;
+                        if (data && data.detail) {
+                            errorMsg = data.detail.message || (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
                         }
-                        chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore:</b> ${data.detail}</div>`;
+                        chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore di Sicurezza:</b> ${errorMsg}</div>`;
+                        chatOutput.scrollTop = chatOutput.scrollHeight;
+                        return; // Blocca l'esecuzione qui
                     }
+
+                    // 2. GESTIONE STREAM: Accumuliamo tutto in memoria prima di mostrare
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder("utf-8");
+                    let fullText = "";
+
+                    // Il server sta generando e controllando... noi accumuliamo e basta
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break; 
+
+                        const token = decoder.decode(value, { stream: true });
+                        fullText += token;
+                    }
+
+                    // ─── QUI LO STREAM È FINITO E IL CONTROLLO RELEVANCE È PASSATO ───
+
+                    // 3. CONTROLLO SE IL BACKEND HA RILEVATO UN BLOCCO DOPO LA GENERAZIONE
+                    if (fullText.startsWith("[SECURITY_BLOCKED]")) {
+                        const cleanMsg = fullText.replace("[SECURITY_BLOCKED]", "").trim();
+                        chatOutput.innerHTML += `
+                            <div class="message bot-msg security-warning" style="border-left: 4px solid #ff9800; background-color: #fff3e0; padding: 8px;">
+                                <b>Sistema di Sicurezza (Output):</b> ${marked.parse(cleanMsg)}
+                            </div>`;
+                    } else {
+                        // 4. CASO STANDARD: Tutto sicuro, mostriamo l'intera risposta d'un colpo
+                        chatOutput.innerHTML += `<div class="message bot-msg"><b>Bot:</b> ${marked.parse(fullText)}</div>`;
+                    }
+
+                    
                 } catch (e) {
-                    chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore:</b> Impossibile contattare il server.</div>`;
+                    // 🪲 CONTROLLO SE L'ERRORE È DOVUTO ALL'INTERRUZIONE VOLONTARIA
+                    if (e.name === 'AbortError') {
+                        console.log("[DEBUG RAG] Generazione interrotta dall'utente.");
+                        chatOutput.innerHTML += `
+                            <div class="message bot-msg" style="color:#fa8c16; background-color: #fffb8f; border-left: 4px solid #fa8c16; padding: 8px;">
+                                <i>Generazione interrotta dall'utente.</i>
+                            </div>`;
+                    } else {
+                        // Gestione dei normali errori di rete
+                        console.error("[DEBUG RAG] Errore di rete:", e);
+                        chatOutput.innerHTML += `
+                            <div class="message bot-msg" style="color:red; background-color: #fff1f0; border-left: 4px solid #ff4d4f; padding: 8px;">
+                                <b>Errore di Rete:</b> Impossibile connettersi al server.
+                                <br><small style="color: #555;">Dettaglio: ${e.message}</small>
+                            </div>`;
+                    }
+                } finally {
+                    // Una volta terminata la richiesta (con successo o errore), azzeriamo il controller
+                    currentAbortController = null;
                 }
                 chatOutput.scrollTop = chatOutput.scrollHeight;
             }
@@ -343,33 +433,27 @@ async def main_interface():
     </html>
     """
     return HTMLResponse(content=html_content)
+
 @app.post("/chat/")
-async def chat_endpoint(payload: dict):
+async def chat_endpoint(payload: dict, request: Request):
     question = payload.get("question")
     role = payload.get("role", "user")
     level = payload.get("level", "public")
     language = payload.get("language", "italiano")
-    
+
     if not question:
         raise HTTPException(status_code=400, detail="Domanda mancante")
 
-    try:
-        # Chiamiamo la pipeline completa e centralizzata che abbiamo protetto prima
-        result = await ask_question(
-            query=question, 
-            db_role=role, 
-            user_level=level, 
-            language=language
-        )
-        return result
-
-    except HTTPException as http_err:
-        # Se ask_question lancia una HTTPException (es. blocco sicurezza), la rilanciamo al client
-        raise http_err
-    except Exception as e:
-        # Errore generico di sistema
-        print(f"[-] Errore imprevisto nel backend: {str(e)}")
-        raise HTTPException(status_code=500, detail="Errore interno del server durante l'elaborazione.")
+    return StreamingResponse(
+        ask_question(
+            query=question,
+            db_role=role,
+            user_level=level,
+            language=language,
+            request=request
+        ),
+        media_type="text/event-stream"
+    )
 
 @app.post("/uploadfile/")
 async def upload_file(file: UploadFile = File(...), access_level: str = Form(...), module_option: str = Form(...), expiry_date: str = Form(None), db_role: str = Form("user")):

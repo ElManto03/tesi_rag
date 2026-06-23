@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.msi
 
 # Unit test / coverage reports
 htmlcov/
@@ -57,3 +58,5 @@ venv.bak/
 
 files/*
 output_dir/*
+*debug*/
+prova*/

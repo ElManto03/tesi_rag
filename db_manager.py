@@ -4,11 +4,27 @@ from abc import ABC, abstractmethod
 import psycopg
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
+from models import User
 from config import settings
 
 # Inizializziamo l'engine una sola volta a livello di modulo per gestire meglio
 # il pool di connessioni, invece di ricrearlo per ogni file salvato.
 db_engine = create_engine(str(settings.SQLALCHEMY_DATABASE_URI), future=True)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+
+def ottenere_utente_da_db(email: str):
+    """
+    Versione isolata: apre e chiude la sessione in autonomia.
+    Nessun impatto sul resto del progetto.
+    """
+    db = SessionLocal() # Apre la connessione a Postgres
+    try:
+        utente = db.query(User).filter(User.email == email).first()
+        return utente
+    finally:
+        db.close()
 
 
 class VectorStoreAdapter(ABC):

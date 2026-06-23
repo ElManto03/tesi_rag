@@ -117,9 +117,6 @@ input_scanners = [
     #Toxicity(match_type=MatchType.SENTENCE, use_onnx=True)
 ]
 
-RISPOSTA_STANDARD = "Mi dispiace, ma non ho trovato questa specifica informazione nei regolamenti o nelle circolari ufficiali della scuola. Ti invitiamo a contattare direttamente la segreteria."
-INTRODUZIONE_STANDARD = "Assistente Virtuale Ufficiale dell'ITTS \"O.Belluzzi L.da Vinci\""
-
 EMBED_MODEL_NAME = "qwen3-embedding:8b" # Assicurati che coincida con quello usato per i documenti
 CHAT_MODEL_NAME = "qwen2.5:14b-instruct-q4_K_M"
 
@@ -186,21 +183,21 @@ def retrieve_context(query_embedding, db_role: str, user_level: str, top_k: int 
                 if row.distance > 0.75:
                     continue
                 file_name = row.file_name
-            
+
                 # Se non abbiamo ancora visto questo file, gli assegniamo il prossimo ID disponibile
                 if file_name not in file_to_id:
                     file_to_id[file_name] = current_doc_id
                     current_doc_id += 1
-            
+
                 # Recuperiamo l'ID corretto (associato stabilmente a questo file)
                 assigned_id = file_to_id[file_name]
-            
+
                 decrypted_text = cipher_suite.decrypt(row.encrypted_content.encode()).decode()
-            
+
                 # Usiamo assigned_id invece di doc_id
                 xml_chunk = f'<doc id="{assigned_id}", page="{row.page_number}">\n{decrypted_text}\n</doc>'
                 context_parts.append(xml_chunk)
-            
+
                 sources.append({
                     "id": assigned_id,
                     "file_name": row.file_name,

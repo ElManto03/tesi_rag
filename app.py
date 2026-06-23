@@ -4,26 +4,122 @@ import os
 import logging
 import shutil
 import tempfile
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+import datetime
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 from authlib.integrations.starlette_client import OAuth
-from db_manager import create_db_and_tables # Importa la funzione di creazione tabelle
+from jose import jwt
+from db_manager import create_db_and_tables, ottenere_utente_da_db # Importa la funzione di creazione tabelle
 from file_processor import process_single_file # Importa la funzione di elaborazione file
 from chatbot import get_query_embedding, retrieve_context, generate_answer, is_query_safe, ask_question
 from file_server import router as file_router
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     create_db_and_tables()
     yield
 
+JWT_SECRET_KEY = os.getenv("JWT_ENCRYPTION_KEY")
+SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+ALGORITHM = "HS256"
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
 app.include_router(file_router)
 oauth = OAuth()
+
+oauth.register(
+    name='google',
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
+
+@app.middleware("http")
+async def blindaggio_autenticazione(request: Request, call_next):
+    # 1. Definiamo le uniche rotte "pubbliche" che Google o il sistema devono poter raggiungere
+    rotte_pubbliche = [
+        "/login",          # La rotta che avvia il bridge con Google
+        "/auth/callback",  # La rotta di ritorno da Google
+    ]
+    
+    # Se l'utente sta cercando di andare al login o al callback, lo lasciamo passare liberamente
+    if request.url.path in rotte_pubbliche:
+        return await call_next(request)
+    
+    # 2. Controlliamo se esiste il token nei cookie di sessione
+    token_sessione = request.cookies.get("session_token")
+    
+    # 3. SE IL TOKEN NON C'È: Blocchiamo l'accesso e deviamo l'utente sulla rotta /login
+    if not token_sessione:
+        # Questo forza il browser a caricare immediatamente il flusso Google OAuth
+        return RedirectResponse(url="/login")
+    
+    # SE IL TOKEN C'È: L'utente è autenticato, procediamo normalmente verso la chat o le API
+    response = await call_next(request)
+    return response
+
+@app.get('/login')
+async def login(request: Request):
+    # Reindirizza l'utente alla pagina di login di Google
+    redirect_uri = request.url_for('auth_callback')
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+@app.get('/auth/callback')
+async def auth_callback(request: Request):
+    # 1. Recupera i dati da Google
+    token = await oauth.google.authorize_access_token(request)
+    user_info = token.get('userinfo')
+    email_utente = user_info.get('email')
+    
+    if not email_utente:
+        raise HTTPException(status_code=400, detail="Impossibile recuperare l'email da Google.")
+
+    # 2. INTERROGA IL TUO DATABASE POSTGRES
+    # (Adatta questa riga alla logica con cui interroghi il DB, es. SQLAlchemy o connessione diretta)
+    utente_db = ottenere_utente_da_db(email_utente) 
+    
+    # Se l'email non è censita nel DB (quindi non è un prof/responsabile autorizzato)
+    if not utente_db:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accesso negato. Questo account non è autorizzato ad accedere al sistema scolastico."
+        )
+        
+    # 3. GENERA IL TUO JWT LOCALE (I dati che serviranno alle Row Level Security)
+    scadenza = datetime.datetime.utcnow() + datetime.timedelta(hours=8) # La sessione dura 8 ore
+    payload_jwt = {
+        "sub": email_utente,
+        "role": utente_db.user_role,    # es. 'teacher'
+        "exp": scadenza
+    }
+    
+    token_locale = jwt.encode(payload_jwt, JWT_SECRET_KEY, algorithm=ALGORITHM)
+    
+    # 4. CREA IL REINDIRIZZAMENTO VERSO LA CHAT (es. la rotta Radice "/")
+    response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    
+    # 5. SALVA IL TOKEN NEI COOKIE DEL BROWSER
+    response.set_cookie(
+        key="session_token",
+        value=token_locale,
+        httponly=True,   # CRITICO PER LA SICUREZZA: impedisce a script JS malevoli di rubare il token (Mitiga XSS)
+        max_age=28800,   # Durata in secondi (8 ore)
+        samesite="lax"   # Protegge da attacchi CSRF
+    )
+    
+    return response
 
 @app.get("/", response_class=HTMLResponse)
 async def main_interface():

@@ -124,7 +124,7 @@ async def auth_callback(request: Request):
 @app.get("/", response_class=HTMLResponse)
 async def main_interface():
     """
-    Interfaccia web con menu per navigare tra Chatbot e Upload.
+    Interfaccia web con menu per navigare tra Chatbot e Upload, con banner GDPR e avvisi di sicurezza.
     """
     html_content = """
     <!DOCTYPE html>
@@ -180,9 +180,81 @@ async def main_interface():
                 transition: background-color 0.3s;
             }
             #drop-zone.dragover { background-color: #bae7ff; border-color: #40a9ff; }
+
+            /* ─── STILI INFORMATIVA IA E DIZIONARIO AI ─── */
+            .ai-disclaimer {
+                margin-top: 8px;
+                font-size: 0.85rem;
+                color: #595959;
+                line-height: 1.4;
+                background-color: #fffbe6;
+                border: 1px solid #ffe58f;
+                padding: 8px 12px;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            /* ─── STILI OVERLAY E BANNER GDPR ─── */
+            #gdpr-overlay {
+                position: fixed;
+                top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(0, 0, 0, 0.7);
+                z-index: 9999;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .gdpr-banner {
+                background: white;
+                padding: 30px;
+                border-radius: 8px;
+                max-width: 600px;
+                width: 90%;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+                max-height: 85vh;
+                overflow-y: auto;
+            }
+            .gdpr-banner h3 { margin-top: 0; color: #001529; }
+            .gdpr-text { font-size: 0.9rem; color: #333; line-height: 1.5; margin-bottom: 20px; }
+            .gdpr-checkbox-container { margin-bottom: 15px; font-size: 0.9rem; }
+            .gdpr-checkbox-container label { display: block; margin-bottom: 8px; cursor: pointer; }
+            .gdpr-buttons { display: flex; gap: 10px; justify-content: flex-end; }
+            .btn-accept { background: #52c41a; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+            .btn-accept:hover { background: #73d13d; }
+            .btn-accept:disabled { background: #f5f5f5; color: #bfbfbf; border: 1px solid #d9d9d9; cursor: not-allowed; }
         </style>
     </head>
     <body>
+
+        <div id="gdpr-overlay">
+            <div class="gdpr-banner">
+                <h3>Informativa sul Trattamento dei Dati Personali (GDPR)</h3>
+                <div class="gdpr-text">
+                    <p>Ai sensi del Regolamento UE 2016/679 ("GDPR"), si informa l'utente che questa applicazione tratta dati personali adottando idonee misure di sicurezza.</p>
+                    <p><b>Tipologia di dati raccolti:</b> Il sistema raccoglie ed elabora esclusivamente il <b>testo dei prompt (domande)</b> inviati direttamente dall'utente all'interno della chat, al fine esclusivo di elaborare e generare la risposta tramite il sistema RAG.</p>
+                    <p><b>Finalità:</b> Fornitura del servizio di assistenza documentale e risposte a quesiti sui documenti scolastici inseriti.</p>
+                    <p><b>Conservazione:</b> I dati non vengono ceduti a terzi e sono memorizzati unicamente per il tempo strettamente necessario all'esecuzione del servizio.</p>
+                </div>
+                
+                <div class="gdpr-checkbox-container">
+                    <label>
+                        <input type="checkbox" id="gdpr-check-consent" onchange="validateGdprForm()"> 
+                        Acconsento al trattamento del testo dei miei prompt per le finalità indicate.
+                    </label>
+                    <label>
+                        <input type="checkbox" id="gdpr-check-age" onchange="validateGdprForm()"> 
+                        Dichiaro di avere un'età superiore a 14 anni <b>OPPURE</b> che il presente consenso è prestato/autorizzato dall'esercente la responsabilità genitoriale.
+                    </label>
+                </div>
+
+                <div class="gdpr-buttons">
+                    <button id="gdpr-submit" class="btn-accept" disabled onclick="acceptGdpr()">Accetta e Continua</button>
+                </div>
+            </div>
+        </div>
+
         <nav>
             <a id="nav-chat" onclick="showSection('chat')" class="active">Chatbot</a>
             <a id="nav-upload" onclick="showSection('upload')">Upload Documenti</a>
@@ -213,7 +285,6 @@ async def main_interface():
         </nav>
 
         <div class="container">
-            <!-- Sezione Chatbot -->
             <div id="section-chat" class="section active">
                 <h2>Interroga il Chatbot</h2>
                 <div class="chat-box" id="chat-output">Benvenuto! Carica un documento o fammi una domanda...</div>
@@ -221,18 +292,22 @@ async def main_interface():
                 <button id="send-btn" onclick="sendMessage()">Invia</button>
                 <button id="stop-btn" onclick="stopMessage()" style="background-color: #ff4d4f;">Ferma</button>
                 <button id="block-btn" onclick="blockPrompt()" style="background-color: #fa8c16;">Blocca</button>
+                
+                <div class="ai-disclaimer">
+                    <span>⚠️</span>
+                    <span><b>Nota di trasparenza:</b> Si sta conversando con un sistema di Intelligenza Artificiale. Le risposte sono generate automaticamente basandosi sui documenti d'archivio e potrebbero contenere imprecisioni. <b>Si invita a verificare l'esattezza delle informazioni fornite consultando direttamente le fonti e i link allegati in calce alla risposta.</b></span>
+                </div>
             </div>
 
-            <!-- Sezione Upload -->
             <div id="section-upload" class="section">
                 <h2>Carica Nuovo Documento</h2>
-                <p>Seleziona file o una cartella per caricarli massivamente. Sono accettati solo file .docx, .html e .pdf (consigliato).</p>
+                <p>Seleziona file o una cartella per caricarli massivamente. Sono accettati solo file .docx e .pdf (consigliato).</p>
                 <label for="fileInput"><b>Carica cartella:</b></label>
                 <input type="file" id="fileInput" multiple webkitdirectory mozdirectory>
                 <p><b>O carica file singoli qui sotto:</b></p>
 
-                <input type="file" id="hiddenFileInput" accept=".pdf,.docx,.html" multiple style="display: none;">
-                <div id="drop-zone">Trascina qui i tuoi file .pdf, .docx o .html (o clicca per selezionarli)</div>
+                <input type="file" id="hiddenFileInput" accept=".pdf,.docx" multiple style="display: none;">
+                <div id="drop-zone">Trascina qui i tuoi file .pdf o .docx (o clicca per selezionarli)</div>
 
                 <div id="upload-controls" style="display:none; margin-top: 20px;">
                     <button onclick="processAll()">Avvia Elaborazione Massiva</button>
@@ -256,14 +331,33 @@ async def main_interface():
         <script>
             let currentAbortController = null;
 
+            // ─── LOGICA DI VERIFICA GDPR AL CARICAMENTO ───
+            function checkGdprConsent() {
+                const consent = localStorage.getItem('gdpr_consent_accepted');
+                if (consent === 'true') {
+                    document.getElementById('gdpr-overlay').style.display = 'none';
+                } else {
+                    document.getElementById('gdpr-overlay').style.display = 'flex';
+                }
+            }
+
+            function validateGdprForm() {
+                const consentChecked = document.getElementById('gdpr-check-consent').checked;
+                const ageChecked = document.getElementById('gdpr-check-age').checked;
+                document.getElementById('gdpr-submit').disabled = !(consentChecked && ageChecked);
+            }
+
+            function acceptGdpr() {
+                localStorage.setItem('gdpr_consent_accepted', 'true');
+                document.getElementById('gdpr-overlay').style.display = 'none';
+            }
+
             marked.use({
                 renderer: {
                     link(token) {
-                        // Estraiamo le proprietà dall'oggetto token
                         const href = token.href || '';
                         const title = token.title ? `title="${token.title}"` : '';
                         const text = token.text || href;
-                        
                         return `<a href="${href}" ${title} target="_blank" rel="noopener noreferrer">${text}</a>`;
                     }
                 }
@@ -276,7 +370,6 @@ async def main_interface():
                 localStorage.setItem('simRole', role);
                 localStorage.setItem('simLevel', level);
                 localStorage.setItem('simLang', lang);
-                // Se cambiamo in user mentre siamo in upload, torniamo alla chat
                 const currentSection = localStorage.getItem('activeSection') || 'chat';
                 showSection(role === 'user' ? 'chat' : currentSection);
             }
@@ -289,7 +382,6 @@ async def main_interface():
                 document.getElementById('sim-level').value = level;
                 document.getElementById('sim-lang').value = lang;
 
-                // UI Restriction: L'utente vede solo il chatbot
                 document.getElementById('nav-upload').style.display = (role === 'user') ? 'none' : 'inline';
                 if (role === 'user' && id === 'upload') id = 'chat';
 
@@ -300,23 +392,22 @@ async def main_interface():
                 localStorage.setItem('activeSection', id);
             }
 
-            // Al caricamento della pagina, ripristina l'ultima sezione visitata
             document.addEventListener('DOMContentLoaded', () => {
+                checkGdprConsent(); // Controlla lo stato GDPR ad ogni caricamento/refresh
                 updateRole();
             });
 
             let selectedFiles = [];
 
-            // Gestione selezione file (sia cartella che file multipli)
             const handleFileSelection = (e) => handleFiles(e.target.files);
 
             function handleFiles(fileList) {
                 const files = Array.from(fileList).filter(f =>
-                    f.name.endsWith('.pdf') || f.name.endsWith('.docx') || f.name.endsWith('.html')
+                    f.name.endsWith('.pdf') || f.name.endsWith('.docx')
                 );
 
                 if (files.length === 0) {
-                    alert("Nessun file .pdf, .docx o .html valido trovato nella selezione. Si prega di selezionare file supportati.");
+                    alert("Nessun file .pdf, .docx valido trovato nella selezione. Si prega di selezionare file supportati.");
                     document.getElementById('upload-controls').style.display = 'none';
                     return;
                 }
@@ -328,9 +419,8 @@ async def main_interface():
                 }
             }
 
-            // Drag and Drop Logic
             const dropZone = document.getElementById('drop-zone');
-            const hiddenFileInput = document.getElementById('hiddenFileInput'); // Nuovo input nascosto
+            const hiddenFileInput = document.getElementById('hiddenFileInput');
             ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(name => {
                 dropZone.addEventListener(name, (e) => { e.preventDefault(); e.stopPropagation(); });
             });
@@ -340,10 +430,10 @@ async def main_interface():
                 dropZone.classList.remove('dragover');
                 handleFiles(e.dataTransfer.files);
             });
-            dropZone.addEventListener('click', () => hiddenFileInput.click()); // Attiva il click sull'input nascosto
+            dropZone.addEventListener('click', () => hiddenFileInput.click());
 
             document.getElementById('fileInput').addEventListener('change', handleFileSelection);
-            hiddenFileInput.addEventListener('change', handleFileSelection); // Ascolta il cambio del nuovo input nascosto
+            hiddenFileInput.addEventListener('change', handleFileSelection);
 
             function renderTable() {
                 const tbody = document.getElementById('file-table-body');
@@ -438,20 +528,15 @@ async def main_interface():
                 const level = localStorage.getItem('simLevel') || 'public';
                 const lang = localStorage.getItem('simLang') || 'italiano';
 
-                // Aggiungi messaggio utente
                 chatOutput.innerHTML += `<div class="message user-msg"><b>Tu:</b> ${text}</div>`;
                 input.value = '';
                 chatOutput.scrollTop = chatOutput.scrollHeight;
 
-                // ─── NUOVA LOGICA ABORT CONTROLLER ───
-                // Se c'era una generazione precedente ancora attiva, la interrompiamo per sicurezza
                 if (currentAbortController) {
                     currentAbortController.abort();
                 }
-                // Creiamo un nuovo controller per questa specifica richiesta
                 currentAbortController = new AbortController();
                 const signal = currentAbortController.signal;
-                // ─────────────────────────────────────
 
                 try {
                     const response = await fetch('/chat/', {
@@ -469,15 +554,13 @@ async def main_interface():
                         }
                         chatOutput.innerHTML += `<div class="message bot-msg" style="color:red"><b>Errore di Sicurezza:</b> ${errorMsg}</div>`;
                         chatOutput.scrollTop = chatOutput.scrollHeight;
-                        return; // Blocca l'esecuzione qui
+                        return;
                     }
 
-                    // 2. GESTIONE STREAM: Accumuliamo tutto in memoria prima di mostrare
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder("utf-8");
                     let fullText = "";
 
-                    // Il server sta generando e controllando... noi accumuliamo e basta
                     while (true) {
                         const { value, done } = await reader.read();
                         if (done) break; 
@@ -486,9 +569,6 @@ async def main_interface():
                         fullText += token;
                     }
 
-                    // ─── QUI LO STREAM È FINITO E IL CONTROLLO RELEVANCE È PASSATO ───
-
-                    // 3. CONTROLLO SE IL BACKEND HA RILEVATO UN BLOCCO DOPO LA GENERAZIONE
                     if (fullText.startsWith("[SECURITY_BLOCKED]")) {
                         const cleanMsg = fullText.replace("[SECURITY_BLOCKED]", "").trim();
                         chatOutput.innerHTML += `
@@ -496,13 +576,10 @@ async def main_interface():
                                 <b>Sistema di Sicurezza (Output):</b> ${marked.parse(cleanMsg)}
                             </div>`;
                     } else {
-                        // 4. CASO STANDARD: Tutto sicuro, mostriamo l'intera risposta d'un colpo
                         chatOutput.innerHTML += `<div class="message bot-msg"><b>Bot:</b> ${marked.parse(fullText)}</div>`;
                     }
 
-                    
                 } catch (e) {
-                    // 🪲 CONTROLLO SE L'ERRORE È DOVUTO ALL'INTERRUZIONE VOLONTARIA
                     if (e.name === 'AbortError') {
                         console.log("[DEBUG RAG] Generazione interrotta dall'utente.");
                         chatOutput.innerHTML += `
@@ -510,7 +587,6 @@ async def main_interface():
                                 <i>Generazione interrotta dall'utente.</i>
                             </div>`;
                     } else {
-                        // Gestione dei normali errori di rete
                         console.error("[DEBUG RAG] Errore di rete:", e);
                         chatOutput.innerHTML += `
                             <div class="message bot-msg" style="color:red; background-color: #fff1f0; border-left: 4px solid #ff4d4f; padding: 8px;">
@@ -519,7 +595,6 @@ async def main_interface():
                             </div>`;
                     }
                 } finally {
-                    // Una volta terminata la richiesta (con successo o errore), azzeriamo il controller
                     currentAbortController = null;
                 }
                 chatOutput.scrollTop = chatOutput.scrollHeight;
@@ -529,6 +604,7 @@ async def main_interface():
     </html>
     """
     return HTMLResponse(content=html_content)
+
 
 @app.post("/chat/")
 async def chat_endpoint(payload: dict, request: Request):

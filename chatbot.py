@@ -118,13 +118,14 @@ input_scanners = [
 ]
 
 EMBED_MODEL_NAME = "qwen3-embedding:8b" # Assicurati che coincida con quello usato per i documenti
-CHAT_MODEL_NAME = "qwen2.5:14b-instruct-q4_K_M"
+CHAT_MODEL_NAME = "qwen2.5:7b-instruct-q4_K_M"
 
 llm = Ollama(
     model=CHAT_MODEL_NAME, 
-    base_url="http://localhost:11434", 
+    base_url="http://localhost:11434",
+    context_window=8192,
     request_timeout=120.0,
-    additional_kwargs={"options": {"temperature": 0.2, "num_ctx": 8192}}
+    additional_kwargs={"options": {"temperature": 0.2}}
 )
 
 embedding_adapter = OllamaEmbeddingAdapter(model_name=EMBED_MODEL_NAME)
@@ -180,7 +181,7 @@ def retrieve_context(query_embedding, db_role: str, user_level: str, top_k: int 
             current_doc_id = 1
 
             for row in rows:
-                if row.distance > 0.75:
+                if row.distance > 0.7:
                     continue
                 file_name = row.file_name
 
@@ -215,7 +216,7 @@ async def generate_answer(query: str, context: str, request):
     prompt = f"""### SYSTEM PROMPT: ASSISTENTE INFORMATIVO SCOLASTICO
 
 ### 1. IDENTITY & AUDIENCE
-- Tu sei l'Assistente Virtuale Ufficiale dell' ITTS "O.Belluzzi L.da Vinci".
+- Tu sei l'Assistente Virtuale Ufficiale dell' ITTS \"O.Belluzzi L.da Vinci\"".
 - Se ti devi presentare includi sempre nella risposta la frase \"Sono l'Assistente Virtuale Ufficiale dell'ITTS \"O.Belluzzi L.da Vinci\"\", o il suo corrispettivo in un altra lingua se richiesto.
 - Il tuo pubblico di riferimento è composto esclusivamente da famiglie, genitori e studenti di scuola superiore.
 - Il tuo tono deve essere istituzionale, chiaro, accogliente, accessibile e assolutamente neutrale. Rielabora i testi burocratici in modo che siano facilmente comprensibili per le famiglie, ma senza alterarne il significato.

@@ -1,6 +1,7 @@
 import os
 import re
 import numpy as np
+import docx
 from pypdf import PdfReader, PdfWriter
 from pdf2image import convert_from_path
 from PIL import Image
@@ -9,6 +10,7 @@ from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.converter import PDFPageAggregator
 from pdfminer.layout import LAParams, LTTextBox, LTTextLine, LTChar
+from security_rules import BLOCKLIST_PROMPT_INJECTION
 
 def clean_junk_text(text):
     """Rimuove le righe di boilerplate della scuola dal testo markdown."""
@@ -44,6 +46,36 @@ def is_marker_reliable(vision_text, marker_text):
     v_count = len(re.findall(r'\w', vision_text))
     m_count = len(re.findall(r'\w', marker_text))
     return m_count >= (v_count * 0.5) # Affidabile se ha almeno il 50% dei caratteri
+
+def pre_ispezione_sicurezza_docx(file_path):
+    """
+    Scansiona a basso livello il file DOCX alla ricerca di anomalie stilistiche:
+    - Testo colorato di bianco (RGB: FFFFFF o 'white')
+    - Testo microscopico (font size inferiore a una soglia critica)
+    """
+    doc = docx.Document(file_path)
+    soglia_font_minimo = 4.5 # Sotto i 5-6 punti il testo è praticamente illeggibile ad occhio umano
+    
+    for p_idx, paragrafo in enumerate(doc.paragraphs, start=1):
+        for run in paragrafo.runs:
+            # A) CONTROLLO COLORE (Testo Bianco)
+            if run.font.color and run.font.color.rgb:
+                if run.font.color.rgb == docx.shared.RGBColor(255, 255, 255):
+                    # Trovato testo bianco!
+                    if run.text.strip(): # Verifichiamo che non siano solo spazi vuoti
+                        print(f"🚨 [CRITICAL ALERT] Rilevato testo nascosto (BIANCO) al paragrafo {p_idx}!")
+                        raise ValueError("Sicurezza Violata: Il documento Word contiene testo bianco nascosto.")
+            
+            # B) CONTROLLO DIMENSIONI (Testo Microscopico)
+            if run.font.size:
+                # In python-docx il font size è espresso in Pt (punti)
+                if run.font.size.pt < soglia_font_minimo:
+                    if run.text.strip():
+                        print(f"🚨 [CRITICAL ALERT] Rilevato testo microscopico ({run.font.size.pt}pt) al paragrafo {p_idx}!")
+                        raise ValueError("Sicurezza Violata: Il documento Word contiene testo microscopico.")
+                        
+    print("   [✓] Pre-ispezione DOCX: Nessun testo nascosto o microscopico rilevato.")
+    return True
 
 def trova_punto_taglio_ottimale(img):
     """Individua la riga di pixel per il taglio orizzontale senza spezzare il testo."""
@@ -139,13 +171,7 @@ def analizza_geometria_e_sicurezza(pdf_path_pulito):
     testo_invisibile_rilevato = False
     pagine_sospette = set()
     
-    pattern_injection = [
-        r"ignora le istruzioni", 
-        r"ignore previous instructions", 
-        r"da ora in poi agisci come", 
-        r"tu sei un modello di ia", 
-        r"system prompt bypass"
-    ]
+    pattern_injection = BLOCKLIST_PROMPT_INJECTION
 
     with open(pdf_path_pulito, 'rb') as fp:
         for page_num, page in enumerate(PDFPage.get_pages(fp), start=1):

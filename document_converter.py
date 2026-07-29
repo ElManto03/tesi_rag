@@ -34,7 +34,7 @@ from llama_index.core.schema import ImageDocument
 from document_preprocessing import (
     clean_junk_text, check_ocr_basic_quality, is_marker_reliable,
     trova_punto_taglio_ottimale, croppa_su_testo_reale, esegui_pipeline_sicurezza,
-    sanitizza_txt_e_markdown
+    sanitizza_txt_e_markdown, pre_ispezione_sicurezza_docx
 )
 
 # Configurazione cartella debug per MD
@@ -47,10 +47,10 @@ os.environ.setdefault('PYPANDOC_PANDOC', 'C:/Users/federico.mantoni/AppData/Loca
 os.environ["LLM_SERVICE"] = "openai" 
 os.environ["OLLAMA_API_BASE"] = "http://localhost:11434"
 os.environ["OPENAI_API_KEY"] = "ollama" # Ollama non richiede chiave, ma Marker sì
-os.environ["GEN_MODEL"] = "qwen2.5:14b-instruct-q4_K_M" # Modello generativo per Marker
-CORRECTION_MODEL = "qwen2.5:14b-instruct-q4_K_M"
+os.environ["GEN_MODEL"] = "qwen2.5:7b-instruct-q4_K_M" # Modello generativo per Marker
+CORRECTION_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 
-TABLE_OCR_PROMPT = """Tu sei un OCR visivo avanzato. Il tuo compito è convertire l'immagine in formato Markdown pulito, accurato e strutturato.
+OLD_TABLE_OCR_PROMPT = """Tu sei un OCR visivo avanzato. Il tuo compito è convertire l'immagine in formato Markdown pulito, accurato e strutturato.
 
 Segui queste istruzioni operative tassative:
 
@@ -77,6 +77,24 @@ Segui queste istruzioni operative tassative:
 
 5. REGOLE DI OUTPUT
 - Restituisci ESCLUSIVAMENTE l'output in Markdown. No introduzioni, no commenti, no spiegazioni."""
+
+TABLE_OCR_PROMPT = """Sei un OCR visivo avanzato. Converti l'immagine in Markdown pulito e accurato.
+
+### REGOLE TASSATIVE:
+
+1. **Trascrizione Integrale e Letterale**
+   - Trascrivi ogni singola parola e carattere (sia dentro che fuori dalle tabelle). 
+   - Non riassumere, non omettere e non parafrasare nulla.
+   - Preserva la formattazione originale (grassetto, MAIUSCOLO, elenchi).
+
+2. **Gestione delle Tabelle**
+   - Rappresenta le zone a più colonne come tabelle Markdown standard (`|`).
+   - Per andare a capo dentro una singola cella (es. elenchi o testi multi-riga). non creare righe vuote o spezzate.
+   - Se una riga attraversa l'intera larghezza della tabella (cella unita/colspan), chiudi la tabella, scrivi il testo come titolo o paragrafo normale, e poi apri una nuova tabella.
+
+3. **Formato di Output**
+   - Restituisci esclusivamente il codice Markdown pulito. 
+   - Non inserire introduzioni, spiegazioni, commenti o blocchi di testo prima o dopo l'output."""
 
 PAGE_OCR_PROMPT = """Trascrivine il contenuto in Markdown standard.
 Se trovi a inizio pagina una tabella con più colonne ma una sola di queste è non vuota, considerala come il continuo di una precedente tabella.
@@ -218,9 +236,9 @@ def llm_normalize_markdown(md_text, separator_pattern, pages_per_chunk=3):
     matches = list(re.finditer(separator_pattern, md_text, re.MULTILINE))
     if not matches: return _call_normalization_llm(md_text)
     final_text = ""
-    if matches[0].start() > 0:
-        print("🔧 Normalizzazione testo iniziale...")
-        final_text += _call_normalization_llm(md_text[:matches[0].start()]) + "\n\n"
+    # if matches[0].start() > 0:
+    #     print("🔧 Normalizzazione testo iniziale...")
+    #     final_text += _call_normalization_llm(md_text[:matches[0].start()]) + "\n\n"
     for i in range(0, len(matches), pages_per_chunk):
         start_pos = matches[i].start()
         print(f"🔧 Normalizzazione blocco di pagine a partire da {matches[i].group(0).strip()}...")
@@ -559,22 +577,23 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
     Esegue Marker su PDF, con fallback a Vision-OCR se il risultato è insufficiente
     o se l'OCR è forzata. Include logica ibrida per tabelle.
     """
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    base_output_dir = os.path.join(os.path.abspath(output_dir), base_name)
     
     # --- SANITIZZAZIONE E SICUREZZA ---
     try:
         pdf_path, pagine_sospette = esegui_pipeline_sicurezza(pdf_path)
     except ValueError:
         print(f"❌ File {pdf_path} scartato per violazione sicurezza.")
-        return ""
+        return "", False
+
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    base_output_dir = os.path.join(os.path.abspath(output_dir), base_name)
 
     if force_ocr:
         res = llm_normalize_markdown(glm_ocr(pdf_path), r'\{\d+\}-+')
         os.makedirs(base_output_dir, exist_ok=True)
         with open(os.path.join(base_output_dir, base_name + ".md"), "w", encoding="utf-8") as f:
             f.write(res)
-        return res
+        return res, True
 
     marker_text = run_marker_pdf(pdf_path, output_dir)
     
@@ -590,13 +609,13 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
         os.makedirs(base_output_dir, exist_ok=True)
         with open(os.path.join(base_output_dir, base_name + ".md"), "w", encoding="utf-8") as f:
             f.write(res)
-        return res
+        return res, True
     else:
-        # tables = get_pages_with_tables(base_output_dir)
-        # if tables:
-        #     print(f"📊 Rilevate tabelle nelle pagine: {tables}. Avvio OCR pagina per pagina...")
-        #     ocr_results = glm_ocr(pdf_path, target_page_indices=tables, marker_text=marker_text)
-        #     hybrid = llm_normalize_markdown(assemble_hybrid_markdown(marker_text, ocr_results), r'\{\d+\}-+')
+        tables = get_pages_with_tables(base_output_dir)
+        if tables:
+            print(f"📊 Rilevate tabelle nelle pagine: {tables}. Avvio OCR pagina per pagina...")
+            ocr_results = glm_ocr(pdf_path, target_page_indices=tables, marker_text=marker_text)
+            hybrid = llm_normalize_markdown(assemble_hybrid_markdown(marker_text, ocr_results), r'\{\d+\}-+')
             # Logica Ibrida: cerca tabelle e aggiunge le pagine sospette per forzare l'OCR
         table_pages = set(get_pages_with_tables(base_output_dir))
         if pagine_sospette:
@@ -609,8 +628,8 @@ def run_marker_pdf_with_fallback(pdf_path, output_dir, force_ocr=False):
             ocr_results = glm_ocr(pdf_path, target_page_indices=sorted_pages, marker_text=marker_text)
             hybrid = llm_normalize_markdown(assemble_hybrid_markdown(marker_text, ocr_results), r'\{\d+\}-+')
             with open(os.path.join(base_output_dir, base_name + ".md"), "w", encoding="utf-8") as f: f.write(hybrid)
-            return hybrid
-    return marker_text 
+            return hybrid, True
+    return marker_text, False
 
 # ---- DEBUG
 def ocr_single_image(image_path):
@@ -656,21 +675,22 @@ def get_md_content(file_path, output_dir="output_dir", force_ocr=False, debug_pa
             os.makedirs(debug_out, exist_ok=True)
             with open(os.path.join(debug_out, f"pag.{debug_page}.md"), "w", encoding="utf-8") as f:
                 f.write(res)
-            return res
+            return res, True
         # ---- DEBUG
         return run_marker_pdf_with_fallback(file_path, output_dir, force_ocr=force_ocr)
     elif ext == ".docx":
         if force_ocr:
             print("⚠️ OCR forzata richiesta per DOCX. Attualmente supportata solo per PDF. Procedo con conversione standard.")
-        return convert_to_md_with_docling(file_path, output_dir)
+        pre_ispezione_sicurezza_docx(file_path)
+        return convert_to_md_with_docling(file_path, output_dir), False
 
     elif ext == ".md" or ext == ".txt":
         if force_ocr:
             print("⚠️ OCR forzata richiesta per MD. Non applicabile. Procedo con lettura standard.")
         with open(file_path, "r", encoding="utf-8") as f:
-            return sanitizza_txt_e_markdown(f.read())
+            return sanitizza_txt_e_markdown(f.read()), False
     elif ext == ".csv":
-        return sanitizza_e_leggi_csv(file_path)
+        return sanitizza_e_leggi_csv(file_path), False
 
     # ---- DEBUG
     elif ext in {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}:
@@ -679,8 +699,8 @@ def get_md_content(file_path, output_dir="output_dir", force_ocr=False, debug_pa
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(text)
         print(f"✅ OCR salvato in: {output_path}")
-        return text
+        return text, True
     # ---- DEBUG
     else:
         print(f"Ignoro file non supportato: {file_path}")
-        return None
+        return None, False

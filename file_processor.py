@@ -14,6 +14,8 @@ from document_converter import (
     get_md_content
 )
 
+from document_preprocessing import sanitizza_txt_e_markdown
+
 # Import chunking logic from chunking_embedding.py
 from chunking_embedding import run_semantic_chunking
 from db_manager import save_document_and_chunks_to_db
@@ -30,10 +32,12 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None, debug
     expiry_date = metadata.get("expiry_date") # Extract optional expiry date
 
     print(f"Processing file: {file_path}")
-    content = get_md_content(file_path, output_dir, force_ocr=force_ocr, debug_page=debug_page)
+    content, ocr_used = get_md_content(file_path, output_dir, force_ocr=force_ocr, debug_page=debug_page)
     if not content:
         print(f"❌ Content not available for {file_path}. Skipping.")
         return []
+
+    content = sanitizza_txt_e_markdown(content)
 
     total_pages = get_total_pages(file_path)
     file_url = os.path.abspath(file_path)
@@ -60,7 +64,7 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None, debug
         "total_pages": total_pages,
         "file_hash": file_hash,
         "md_hash": md_hash,
-        "ocr_used": force_ocr,
+        "ocr_used": force_ocr or ocr_used,
         "marker_version": "1.10.2", # This should probably be dynamic or a constant
         "created_at": created_at,
         "expiry_date": expiry_date
@@ -95,14 +99,12 @@ def process_single_file(file_path, output_dir="output_dir", metadata=None, debug
             "total_pages": total_pages,
             "md_hash_sha256": md_hash,
             "pipeline_info": {
-                "ocr_triggered": force_ocr,
+                "ocr_triggered": force_ocr or ocr_used,
                 # Puoi rendere questa stringa dinamica in base a quale funzione ha risposto su document_converter
-                "ocr_engine_used": "MarkerPdf hybrid with qwen2.5vl OCR",
-                "converter_version": "1.10.2",
+                "ocr_engine_used": "qwen2.5vl OCR",
                 # Lascio questi campi pronti per quando vorrai compilarli con i tuoi dati reali
                 "text_splitter": {
-                    "type": "Markdown-Aware Semantic Chunking",
-                    "parameters": "Aggiungi i tuoi parametri qui"
+                    "type": "Markdown-Aware Semantic Chunking"
                 },
                 "embedding_model": "qwen3-embedding:8b"
             },
@@ -148,7 +150,7 @@ def save_semantic_chunks(chunks, output_path):
         json.dump(chunks, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
-    input_path = r"files\REGOLAMENTO-DISTITUTO_AS202526.pdf" 
+    input_path = r"output_dir\sanitized_Regolamento-disciplinare\sanitized_Regolamento-disciplinare.md" 
     output_dir = "output_dir"
     metadata = {"access_level": "public", "module_option": "no"}  # Sostituisci con la logica reale per estrarre l'access level
     ensure_output_dir(output_dir)

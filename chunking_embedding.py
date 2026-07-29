@@ -101,8 +101,58 @@ class LegalSegmenter:
                 refined.append(s)
         return refined
 
+def is_markdown_table(text: str) -> bool:
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if cleaned.startswith("|") and cleaned.endswith("|"):
+            stripped = cleaned.replace("|", "").replace("-", "").replace(":", "").replace(" ", "")
+            if len(stripped) == 0 and len(cleaned) > 2:
+                return True
+    return False
+
+def pre_split_by_headings(nodes):
+    """
+    Se un nodo contiene al suo interno dei titoli principali (# o ##), 
+    lo divide in sotto-nodi in modo che ogni titolo inizi un nuovo blocco.
+    """
+    split_nodes = []
+    # Regex per catturare titoli di livello 1 e 2 (es. # TITOLO o ## TAB. 1)
+    heading_pattern = re.compile(r'^(##? \s*.+)$', re.MULTILINE)
+    
+    for node in nodes:
+        text = node.text
+        parts = heading_pattern.split(text)
+        
+        # Se non ci sono titoli intermedi, tieni il nodo così com'è
+        if len(parts) <= 1:
+            split_nodes.append(node)
+            continue
+            
+        current_text = ""
+        # Il primo elemento è il testo prima del primo titolo (se presente)
+        if parts[0].strip():
+            # Creiamo un duplicato del nodo con il testo parziale
+            from llama_index.core import Document # o la classe che usi per i nodi
+            split_nodes.append(Document(text=parts[0].strip(), metadata=node.metadata))
+            
+        # Ricostruiamo le coppie (Titolo, Contenuto successivo)
+        for i in range(1, len(parts), 2):
+            heading = parts[i]
+            content = parts[i+1] if (i+1) < len(parts) else ""
+            combined = (heading + "\n" + content).strip()
+            if combined:
+                from llama_index.core import Document
+                split_nodes.append(Document(text=combined, metadata=node.metadata))
+                
+    return split_nodes
+
 def chunk_splitter(docs, splitter, md_parser):
-    initial_nodes = md_parser.get_nodes_from_documents(docs)
+    # 1. Parsing iniziale
+    raw_nodes = md_parser.get_nodes_from_documents(docs)
+    
+    # 2. Pre-segmentazione sui titoli per evitare che macro-sezioni rimangano unite
+    initial_nodes = pre_split_by_headings(raw_nodes)
+    
     nodes = []
     
     if len(initial_nodes) > 0:
@@ -111,49 +161,58 @@ def chunk_splitter(docs, splitter, md_parser):
         
         for node in initial_nodes:
             current_text = node.text.strip()
+            current_metadata = node.metadata
             
-            # Uniamo il buffer con il testo del nodo corrente
+            is_current_table = is_markdown_table(current_text)
+            starts_with_heading = current_text.startswith("#")
+            
+            # FLUSH PREVENTIVO:
+            # Se nel buffer c'è qualcosa e il nodo corrente è un titolo o una tabella,
+            # salviamo immediatamente il buffer come chunk a sé stante.
+            if buffer_text and (starts_with_heading or is_current_table):
+                from llama_index.core import Document
+                nodes.append(Document(text=buffer_text, metadata=buffer_metadata))
+                buffer_text, buffer_metadata = "", {}
+            
             if buffer_text:
                 combined_text = buffer_text + "\n\n" + current_text
-                combined_metadata = {**buffer_metadata, **node.metadata}
+                combined_metadata = {**buffer_metadata, **current_metadata}
             else:
                 combined_text = current_text
-                combined_metadata = node.metadata
+                combined_metadata = current_metadata
             
-            is_table = "|-" in combined_text
+            is_combined_table = is_markdown_table(combined_text)
             
-            # CONTROLLO ANTI-TITOLO ORFANO:
-            # Se il blocco accumulato finisce con un titolo (### o più), 
-            # NON dobbiamo chiudere il chunk qui, ma forzare l'accumulo del prossimo nodo.
+            # CONTROLLO ANTI-TITOLO ORFANO
             ends_with_heading = False
             lines = combined_text.splitlines()
             if lines:
                 last_line = lines[-1].strip()
-                # Verifica se l'ultima riga inizia con almeno 3 cancelletti
-                if last_line.startswith("###"):
+                if last_line.startswith("###") or last_line.startswith("##"):
                     ends_with_heading = True
 
-            # Condizione di salvataggio nel buffer: 
-            # Se è troppo corto, OPPURE se finisce con un titolo (anche se ha superato la dimensione minima)
-            if (len(combined_text) < MIN_CHUNK_SIZE or ends_with_heading) and not is_table:
+            # DECISIONE: ACCUMULARE O EMETTERE
+            if (len(combined_text) < MIN_CHUNK_SIZE or ends_with_heading) and not is_combined_table:
                 buffer_text, buffer_metadata = combined_text, combined_metadata
             else:
+                from llama_index.core import Document
                 new_doc = Document(text=combined_text, metadata=combined_metadata)
                 
-                if not is_table and len(combined_text) > MAX_CHUNK_SIZE:   
+                if len(combined_text) > MAX_CHUNK_SIZE:   
                     splitted = splitter.get_nodes_from_documents([new_doc])
                     nodes.extend(splitted if all(len(n.text) >= MIN_CHUNK_SIZE for n in splitted) else [new_doc])
                 else: 
                     nodes.append(new_doc)
                 
-                # Svuotiamo il buffer dopo aver creato il documento
                 buffer_text, buffer_metadata = "", {}
                 
-        # Gestione del residuo finale nel buffer
+        # Residuo finale
         if buffer_text:
             if nodes: 
+                from llama_index.core import Document
                 nodes[-1] = Document(text=nodes[-1].text + "\n\n" + buffer_text, metadata={**nodes[-1].metadata, **buffer_metadata})
             else:
+                from llama_index.core import Document
                 nodes.append(Document(text=buffer_text, metadata=buffer_metadata))
     else: 
         nodes = initial_nodes
@@ -188,7 +247,6 @@ def run_semantic_chunking(text, metadata=None, embed_provider=None):
         buffer_size=3, breakpoint_percentile_threshold=95, 
         embed_model=embed_provider.get_model(), sentence_splitter=custom_sentence_splitter
     )
-    combined_metadata = {**scuola_info, **(metadata or {})}
 
     # Suddividiamo il testo per pagine e rimuoviamo i marcatori di splitting PRIMA del parsing.
     # Questo permette al MarkdownNodeParser e al SemanticSplitter di lavorare su testo pulito.
@@ -196,16 +254,16 @@ def run_semantic_chunking(text, metadata=None, embed_provider=None):
     matches = list(re.finditer(page_pattern, text))
     docs = []
     
-    excluded_keys = ["cf", "mail", "pec", "indirizzo", "tel", "web", "source_path", "access_level"]
+    excluded_keys = ["cf", "mail", "pec", "indirizzo", "tel", "web", "source_path", "access_level", "page_number"]
 
     if not matches:
-        docs = [Document(text=text, metadata={**combined_metadata, "page_number": 1}, 
+        docs = [Document(text=text, metadata={"page_number": 1}, 
                          excluded_embed_metadata_keys=excluded_keys)]
     else:
         # Gestione testo prima del primo tag (solitamente vuoto se il file inizia con {0}---)
         if matches[0].start() > 0:
             docs.append(Document(text=text[:matches[0].start()].strip(), 
-                                 metadata={**combined_metadata, "page_number": 1}, 
+                                 metadata={"page_number": 1}, 
                                  excluded_embed_metadata_keys=excluded_keys))
         
         for i, match in enumerate(matches):
@@ -215,7 +273,7 @@ def run_semantic_chunking(text, metadata=None, embed_provider=None):
             page_content = text[start:end].strip()
             if page_content:
                 docs.append(Document(text=page_content, 
-                                    metadata={**combined_metadata, "page_number": page_num}, 
+                                    metadata={"page_number": page_num}, 
                                     excluded_embed_metadata_keys=excluded_keys))
 
     nodes = chunk_splitter(docs, splitter, md_parser)

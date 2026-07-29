@@ -104,7 +104,7 @@ scanner_ban_topics_out = BanTopics(model=italian_zero_shot_model_topics, topics=
 scanner_language = LanguageSame()
 scanner_urls = MaliciousURLs()
 #scanner_factual = FactualConsistency(model=italian_zero_shot_model, minimum_score=0.5)
-scanner_relevance = Relevance(model=bge_m3_model)
+scanner_relevance = Relevance(model=bge_m3_model, threshold=0.48)  # threshold e top_k possono essere regolati in base ai test
 
 # Inizializzazione globale degli scanner (eseguita all'avvio)
 input_scanners = [
@@ -196,7 +196,7 @@ def retrieve_context(query_embedding, db_role: str, user_level: str, top_k: int 
                 decrypted_text = cipher_suite.decrypt(row.encrypted_content.encode()).decode()
 
                 # Usiamo assigned_id invece di doc_id
-                xml_chunk = f'<doc id="{assigned_id}", page="{row.page_number}">\n{decrypted_text}\n</doc>'
+                xml_chunk = f'<doc id="{assigned_id}" page="{row.page_number}">\n{decrypted_text}\n</doc>'
                 context_parts.append(xml_chunk)
 
                 sources.append({
@@ -208,7 +208,7 @@ def retrieve_context(query_embedding, db_role: str, user_level: str, top_k: int 
 
     except Exception as e:
         print(f"❌ Errore durante il recupero del contesto: {e}")
-        
+    print(sources)
     return "\n\n".join(context_parts), sources
 
 async def generate_answer(query: str, context: str, request):
@@ -287,6 +287,7 @@ Rispondi in formato Markdown rispettando le seguenti regole:
 - Ogni risposta deve essere argomentata e deve fare riferimento esplicito ai documenti forniti.
 
 Rispondi con la stessa lingua del prompt, solo se è italiano o inglese
+Cita sempre le fonti dei documenti in formato [doc X, pag Y] per ogni affermazione.
 """
 #- Se i documenti non specificano le modalità esatte (es. firma dei genitori, presenza di un adulto), dichiara di non poter rispondere nel dettaglio usando la risposta standard *"Mi dispiace, ma non ho trovato questa specifica informazione nei regolamenti o nelle circolari ufficiali della scuola. Ti invitiamo a contattare direttamente la segreteria."*
 
@@ -392,11 +393,7 @@ def esegui_pipeline_output_singola(query_utente: str, chunk_rag, output_llm: str
     # Se passa tutti i passaggi singoli senza attivare i 'return False'
     return testo_corrente, True
 
-async def ask_question(query: str, db_role: str, user_level: str, language, request):
-    """
-    Pipeline completa: sicurezza (llm-guard + regole locali) -> embedding ->
-    recupero contesto (RLS) -> generazione risposta.
-    """
+def valida_input_prompt(query: str, db_role: str, user_level: str):
 
     # ─── INIZIO AUDIT TRAIL ───
     audit_id = f"aud_{uuid.uuid4().hex[:9]}"
@@ -456,7 +453,14 @@ async def ask_question(query: str, db_role: str, user_level: str, language, requ
                 "details": results_valid
             }
         )
+    return audit_payload
 
+
+async def ask_question(query: str, db_role: str, user_level: str, language, request, audit_payload: dict):
+    """
+    Pipeline completa: sicurezza (llm-guard + regole locali) -> embedding ->
+    recupero contesto (RLS) -> generazione risposta.
+    """
     # 3. Generazione embedding utilizzando il prompt sanificato
     t_emb_start = datetime.now()
     query_embedding = get_query_embedding(query)
@@ -476,11 +480,7 @@ async def ask_question(query: str, db_role: str, user_level: str, language, requ
         fallback_msg = "Mi dispiace, ma non ho trovato informazioni specifiche nei documenti ufficiali della scuola per rispondere a questa domanda. Ti invitiamo a contattare direttamente la segreteria."
         audit_payload["output_stage"] = { "security_blocked": False, "final_response_sent": fallback_msg }
         salva_audit_log_bg(db_role, False, audit_payload)
-        yield {
-            "answer": fallback_msg,
-            "sources": [],
-            "security_blocked": False
-        }
+        yield fallback_msg
         return
     # ==========================================
     # GENERAZIONE GENERALE ASINCRONA E BLOCCABILE
@@ -502,6 +502,7 @@ async def ask_question(query: str, db_role: str, user_level: str, language, requ
         return
 
     print(f"[DEBUG PIPELINE] Generazione completata. Avvio controlli di output.")
+    print("answer:", answer)
 
     audit_payload["generation_stage"] = {
         "model": CHAT_MODEL_NAME,
@@ -552,16 +553,16 @@ async def ask_question(query: str, db_role: str, user_level: str, language, requ
     #     for v in unique_sources.values()
     # ]
 
-    # 2. PRIMA di mandare i dati all'LLM, assegna un ID univoco a ciascun FILE differente.
-    # Mappa di supporto: { "REGOLAMENTO.pdf": 1, "Modulo.docx": 2 }
-    file_to_id = {}
-    id_counter = 1
+    # # 2. PRIMA di mandare i dati all'LLM, assegna un ID univoco a ciascun FILE differente.
+    # # Mappa di supporto: { "REGOLAMENTO.pdf": 1, "Modulo.docx": 2 }
+    # file_to_id = {}
+    # id_counter = 1
 
-    for src in sources:
-        name = src["file_name"]
-        if name not in file_to_id:
-            file_to_id[name] = id_counter
-            id_counter += 1
+    # for src in sources:
+    #     name = src["file_name"]
+    #     if name not in file_to_id:
+    #         file_to_id[name] = id_counter
+    #         id_counter += 1
 
         # Nota: Quando componi il testo/XML da mandare all'LLM, usa questo ID:
         # xml_context += f'<doc id="{file_to_id[name]}" file="{name}" page="{src["page_number"]}">...</doc>\n'
@@ -589,7 +590,8 @@ async def ask_question(query: str, db_role: str, user_level: str, language, requ
     for src in sources:
         key = src["file_name"]
         # Recuperiamo l'ID associato a questo file
-        current_doc_id = file_to_id.get(key)
+        current_doc_id = src["id"]
+        #current_doc_id = file_to_id.get(key)
 
         # ─── IL FILTRO PER ID E PAGINA ───
         # Se questo file non è stato citato dall'LLM, lo saltiamo

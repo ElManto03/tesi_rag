@@ -12,7 +12,7 @@ from authlib.integrations.starlette_client import OAuth
 from jose import jwt
 from db_manager import create_db_and_tables, ottenere_utente_da_db # Importa la funzione di creazione tabelle
 from file_processor import process_single_file # Importa la funzione di elaborazione file
-from chatbot import get_query_embedding, retrieve_context, generate_answer, is_query_safe, ask_question
+from chatbot import get_query_embedding, retrieve_context, generate_answer, is_query_safe, ask_question, valida_input_prompt
 from file_server import router as file_router
 from dotenv import load_dotenv
 
@@ -146,7 +146,7 @@ async def main_interface():
             .container { padding: 20px; flex-grow: 1; }
             .section { display: none; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
             .section.active { display: block; }
-            .chat-box { height: 300px; border: 1px solid #d9d9d9; margin-bottom: 10px; padding: 10px; overflow-y: auto; background: #fafafa; }
+            .chat-box { height: 380px; border: 1px solid #d9d9d9; margin-bottom: 10px; padding: 10px; overflow-y: auto; background: #fafafa; }
             input[type="text"], select { padding: 8px; border: 1px solid #d9d9d9; border-radius: 4px; }
             button { padding: 8px 16px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px 0; }
             button:hover { background: #40a9ff; }
@@ -287,7 +287,7 @@ async def main_interface():
         <div class="container">
             <div id="section-chat" class="section active">
                 <h2>Interroga il Chatbot</h2>
-                <div class="chat-box" id="chat-output">Benvenuto! Carica un documento o fammi una domanda...</div>
+                <div class="chat-box" id="chat-output">Benvenuto! Fammi una domanda...</div>
                 <input type="text" id="chat-input" style="width: 55%;" placeholder="Scrivi qui la tua domanda...">
                 <button id="send-btn" onclick="sendMessage()">Invia</button>
                 <button id="stop-btn" onclick="stopMessage()" style="background-color: #ff4d4f;">Ferma</button>
@@ -616,13 +616,16 @@ async def chat_endpoint(payload: dict, request: Request):
     if not question:
         raise HTTPException(status_code=400, detail="Domanda mancante")
 
+    audit_payload = valida_input_prompt(query=question, db_role=role, user_level=level)
+
     return StreamingResponse(
         ask_question(
             query=question,
             db_role=role,
             user_level=level,
             language=language,
-            request=request
+            request=request,
+            audit_payload=audit_payload
         ),
         media_type="text/event-stream"
     )

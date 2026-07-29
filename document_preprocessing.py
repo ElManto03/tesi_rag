@@ -35,7 +35,11 @@ def check_ocr_basic_quality(text):
     if not text or len(text.strip()) < 15:
         return False
     # Controllo righe vuote eccessive o pattern di tabelle allucinate (es. | | | |)
-    if re.search(r'(?:\|\s*){6,}\|', text):
+    pattern_loop = r"(\b[\w\s/'-]{10,120}\b)(?:\s+\1){2,}"
+    match = re.search(pattern_loop, text, flags=re.IGNORECASE)
+    
+    # Cerchiamo se esiste un loop nel testo
+    if re.search(r'(?:\|\s*){6,}\|', text) or match:
         print("🔍 Qualità OCR: Fallito controllo loop o tabelle vuote.")
         return False
     return True

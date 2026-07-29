@@ -43,9 +43,24 @@ async def visualizza_documento(file_name: str):
         raise HTTPException(status_code=404, detail="Documento non trovato.")
     
     # Ritorna il file. 'inline' indica al browser di provare a visualizzarlo (se PDF) anziché scaricarlo
-    return FileResponse(
-        path=target_path,
-        media_type="application/pdf",
-        filename=target_path.name,
-        content_disposition_type="inline"
-    )
+
+    if file_name.lower().endswith('.pdf'):
+        # Se è un PDF, lo mostri nel browser (inline)
+        return FileResponse(target_path, media_type="application/pdf")
+    
+    else:
+        # Se è un file Word (.docx), Excel, o altro, FORZI il download.
+        # Passando il parametro 'filename', FastAPI imposta in automatico 
+        # l'header HTTP Content-Disposition: attachment
+        return FileResponse(
+            path=target_path, 
+            filename=file_name,  # Questo dice al browser di scaricarlo con il suo nome originale
+            media_type="application/octet-stream" # Dice al browser che è un file binario generico da scaricare
+        )
+
+    # return FileResponse(
+    #     path=target_path,
+    #     media_type="application/pdf",
+    #     filename=target_path.name,
+    #     content_disposition_type="inline"
+    # )
